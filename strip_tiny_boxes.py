@@ -17,9 +17,9 @@ IMGSZ = 640
 MIN_PX = 16  # minimum side length in pixels at IMGSZ
 
 
-def process_split(split: str) -> tuple[int, int, int]:
+def process() -> tuple[int, int, int]:
     """Returns (files_scanned, files_modified, boxes_removed)."""
-    lbl_dir = DATASET / "labels" / split
+    lbl_dir = DATASET / "labels"
     if not lbl_dir.exists():
         return 0, 0, 0
 
@@ -55,19 +55,9 @@ def process_split(split: str) -> tuple[int, int, int]:
 
 
 def main():
-    total_scanned = 0
-    total_modified = 0
-    total_removed = 0
-
-    for split in ("train", "val"):
-        s, m, r = process_split(split)
-        total_scanned += s
-        total_modified += m
-        total_removed += r
-        print(f"  {split}: scanned {s} files, modified {m}, removed {r} tiny boxes")
-
-    print(f"\nTotal: scanned {total_scanned} files, modified {total_modified}, "
-          f"removed {total_removed} boxes (any side < {MIN_PX}px at {IMGSZ})")
+    s, m, r = process()
+    print(f"Scanned {s} files, modified {m}, removed {r} tiny boxes "
+          f"(any side < {MIN_PX}px at {IMGSZ})")
 
 
 if __name__ == "__main__":

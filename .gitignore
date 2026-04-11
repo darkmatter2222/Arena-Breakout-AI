@@ -1,8 +1,9 @@
 ﻿# ============================================================
-# Arena-Breakout-AI  —  Project-specific ignores
+# Vision Pipeline  —  Project-specific ignores
 # ============================================================
 
 # ---------- Models / Weights ----------
+models/
 *.pt
 *.onnx
 *.engine
@@ -10,9 +11,6 @@
 
 # ---------- Datasets & Training Data ----------
 dataset/
-dataset_v2/
-dataset_v3/
-datasets/
 
 # ---------- Captures / Harvest (raw images) ----------
 captures/
@@ -21,15 +19,8 @@ harvest/
 # ---------- Training Runs & Results ----------
 runs/
 
-# ---------- Node.js ----------
-node_modules/
-package-lock.json
-
-# ---------- Build / Cache ----------
-.vite/
-
-# ---------- Reports ----------
-v2_cleanse_report.json
+# ---------- Logs ----------
+*.log
 
 # ============================================================
 # Standard Python .gitignore  (from GitHub template)

@@ -1,9 +1,9 @@
 """
 Scrub images with overlapping bounding boxes from the dataset.
 
-Scans dataset/images/{train,val} and their labels. Any image whose label
-file contains two or more boxes that overlap at all (IoU > 0) gets moved
-to dataset/archive/{images,labels}/{split}/. Prints a summary when done.
+Scans dataset/images/ and labels/. Any image whose label file contains
+two or more boxes that overlap at all (IoU > 0) gets moved to
+dataset/archive/{images,labels}/. Prints a summary when done.
 """
 
 import shutil
@@ -52,28 +52,28 @@ def main():
     archived = 0
     scanned = 0
 
-    for split in ("train", "val"):
-        img_dir = DATASET / "images" / split
-        lbl_dir = DATASET / "labels" / split
-        if not img_dir.exists():
+    img_dir = DATASET / "images"
+    lbl_dir = DATASET / "labels"
+    if not img_dir.exists():
+        print("No images directory found.")
+        return
+
+    arch_img = ARCHIVE / "images"
+    arch_lbl = ARCHIVE / "labels"
+    arch_img.mkdir(parents=True, exist_ok=True)
+    arch_lbl.mkdir(parents=True, exist_ok=True)
+
+    for img in sorted(img_dir.iterdir()):
+        if img.suffix.lower() not in (".jpg", ".jpeg", ".png"):
             continue
-
-        arch_img = ARCHIVE / "images" / split
-        arch_lbl = ARCHIVE / "labels" / split
-        arch_img.mkdir(parents=True, exist_ok=True)
-        arch_lbl.mkdir(parents=True, exist_ok=True)
-
-        for img in sorted(img_dir.iterdir()):
-            if img.suffix.lower() not in (".jpg", ".jpeg", ".png"):
-                continue
-            scanned += 1
-            lbl = lbl_dir / (img.stem + ".txt")
-            boxes = parse_boxes(lbl)
-            if len(boxes) >= 2 and has_overlap(boxes):
-                shutil.move(str(img), str(arch_img / img.name))
-                if lbl.exists():
-                    shutil.move(str(lbl), str(arch_lbl / lbl.name))
-                archived += 1
+        scanned += 1
+        lbl = lbl_dir / (img.stem + ".txt")
+        boxes = parse_boxes(lbl)
+        if len(boxes) >= 2 and has_overlap(boxes):
+            shutil.move(str(img), str(arch_img / img.name))
+            if lbl.exists():
+                shutil.move(str(lbl), str(arch_lbl / lbl.name))
+            archived += 1
 
     print(f"Scanned {scanned} images, archived {archived} with overlapping boxes.")
     print(f"Remaining: {scanned - archived}")

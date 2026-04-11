@@ -3,7 +3,6 @@ YOLO11n training script for single-class detection.
 RTX 5090 (32 GB VRAM) · CUDA 12.8 · Ultralytics 8.x
 """
 
-import os
 import random
 import shutil
 import sys
@@ -23,6 +22,8 @@ DATASET_DIR = ROOT / "dataset"
 DATA_YAML   = DATASET_DIR / "data.yaml"
 IMAGES_DIR  = DATASET_DIR / "images"
 LABELS_DIR  = DATASET_DIR / "labels"
+SPLITS_DIR  = DATASET_DIR / "splits"
+MODELS_DIR  = ROOT / "models"
 
 # ── training hyper-parameters ────────────────────────────────────────────
 MODEL_NAME  = "yolo11n.pt"        # nano – fastest, good for real-time
@@ -36,62 +37,48 @@ WORKERS     = 8
 
 
 def split_dataset():
-    """Fresh random train/val split every run — merges everything back first."""
-    train_img = IMAGES_DIR / "train"
-    val_img   = IMAGES_DIR / "val"
-    train_lbl = LABELS_DIR / "train"
-    val_lbl   = LABELS_DIR / "val"
+    """Write splits/train.txt and splits/val.txt with random image paths.
 
-    train_img.mkdir(parents=True, exist_ok=True)
-    val_img.mkdir(parents=True, exist_ok=True)
-    train_lbl.mkdir(parents=True, exist_ok=True)
-    val_lbl.mkdir(parents=True, exist_ok=True)
+    Images and labels stay flat in dataset/images/ and dataset/labels/.
+    Each split file contains one relative path per line (relative to dataset/).
+    """
+    SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Merge val back into train ─────────────────────────────────
-    moved_back = 0
-    for img_path in list(val_img.glob("*.jpg")) + list(val_img.glob("*.png")):
-        dest = train_img / img_path.name
-        if not dest.exists():
-            shutil.move(str(img_path), str(dest))
-            moved_back += 1
-        else:
-            img_path.unlink()  # duplicate
-        lbl = val_lbl / f"{img_path.stem}.txt"
-        lbl_dest = train_lbl / lbl.name
-        if lbl.exists():
-            if not lbl_dest.exists():
-                shutil.move(str(lbl), str(lbl_dest))
-            else:
-                lbl.unlink()
-    if moved_back:
-        print(f"[split] merged {moved_back} val images back into train")
-
-    # ── 2. Fresh random split ────────────────────────────────────────
-    images = sorted(train_img.glob("*.jpg")) + sorted(train_img.glob("*.png"))
+    images = sorted(
+        p for p in IMAGES_DIR.iterdir()
+        if p.suffix.lower() in (".jpg", ".jpeg", ".png")
+    )
     if not images:
-        print("[split] ERROR: no images found in", train_img)
+        print("[split] ERROR: no images found in", IMAGES_DIR)
         sys.exit(1)
 
-    random.seed(SEED)  # reproducible split for cross-run comparison
+    random.seed(SEED)
     random.shuffle(images)
     n_val = max(1, int(len(images) * VAL_SPLIT))
+    val_set = images[:n_val]
+    train_set = images[n_val:]
 
-    for img_path in images[:n_val]:
-        lbl_path = train_lbl / f"{img_path.stem}.txt"
-        shutil.move(str(img_path), str(val_img / img_path.name))
-        if lbl_path.exists():
-            shutil.move(str(lbl_path), str(val_lbl / lbl_path.name))
+    train_txt = SPLITS_DIR / "train.txt"
+    val_txt   = SPLITS_DIR / "val.txt"
+    train_txt.write_text("\n".join(f"images/{p.name}" for p in train_set) + "\n")
+    val_txt.write_text("\n".join(f"images/{p.name}" for p in val_set) + "\n")
 
-    print(f"[split] {len(images)} total → train={len(images) - n_val}, val={n_val}")
+    print(f"[split] {len(images)} total → train={len(train_set)}, val={len(val_set)}")
+    print(f"[split] wrote {train_txt.relative_to(ROOT)} and {val_txt.relative_to(ROOT)}")
 
 
 def update_data_yaml():
-    """Ensure data.yaml points val to images/val."""
-    text = DATA_YAML.read_text()
-    if "images/val" not in text:
-        text = text.replace("val: images/train", "val: images/val")
-        DATA_YAML.write_text(text)
-        print("[yaml] updated data.yaml → val: images/val")
+    """Write data.yaml pointing to text-file splits."""
+    DATA_YAML.write_text(
+        f"# Vision Dataset - YOLO11n Training\n"
+        f"path: {DATASET_DIR.as_posix()}\n"
+        f"train: splits/train.txt\n"
+        f"val: splits/val.txt\n"
+        f"\n"
+        f"names:\n"
+        f"  0: target\n"
+    )
+    print("[yaml] wrote data.yaml → text-file splits")
 
 
 def train():
@@ -198,6 +185,9 @@ def evaluate():
         plots=True,
         save_json=True,       # COCO-format per-image predictions for error analysis
         save_txt=True,        # per-image prediction .txt files
+        project=str(run_dir),
+        name="val",
+        exist_ok=True,
     )
 
     # ── summary metrics ──────────────────────────────────────────────
@@ -246,6 +236,12 @@ def evaluate():
 
     print(f"\nBest weights: {best_pt}")
     print(f"Model size  : {best_pt.stat().st_size / 1024**2:.1f} MB")
+
+    # ── copy best weights to models/ ─────────────────────────────────
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(best_pt), str(MODELS_DIR / "best.pt"))
+    print(f"Copied best.pt → {MODELS_DIR / 'best.pt'}")
+
     print(f"\nKey files for optimization review:")
     print(f"  results.csv          — per-epoch train/val metrics")
     print(f"  predictions.json     — per-image COCO predictions")

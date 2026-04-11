@@ -58,12 +58,7 @@ if not _is_admin():
 # ── Configuration ─────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 
-MODELS = {
-    "v1": BASE_DIR / "runs" / "yolo11n_target" / "weights" / "best.pt",
-    "v2": BASE_DIR / "runs" / "yolo11n_target_v2" / "weights" / "best.pt",
-}
-ACTIVE_MODEL = "v1"  # <── trained on overlap-scrubbed dataset (P=0.970 R=0.891 mAP50=0.962)
-MODEL_PATH = MODELS[ACTIVE_MODEL]
+MODEL_PATH = BASE_DIR / "models" / "best.pt"
 
 CAPTURE_WIDTH = 600
 CAPTURE_HEIGHT = 416
