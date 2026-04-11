@@ -1,0 +1,37 @@
+# ---------- Python ----------
+venv/
+__pycache__/
+*.pyc
+
+# ---------- Node.js ----------
+node_modules/
+package-lock.json
+
+# ---------- Models / Weights ----------
+*.pt
+*.onnx
+*.engine
+*.torchscript
+
+# ---------- Datasets & Training Data ----------
+dataset/
+dataset_v2/
+dataset_v3/
+datasets/
+
+# ---------- Captures / Harvest (raw images) ----------
+captures/
+harvest/
+
+# ---------- Training Runs & Results ----------
+runs/
+
+# ---------- Logs ----------
+logs/
+*.log
+
+# ---------- Build / Cache ----------
+.vite/
+
+# ---------- Reports ----------
+v2_cleanse_report.json

@@ -1,0 +1,1175 @@
+"""
+YOLO Annotation Tool for single-class bounding box labeling.
+
+Reads captures from ./captures/, lets you draw bounding boxes,
+and exports a YOLO-format dataset to ./dataset/.
+
+Output structure (ready for Ultralytics YOLO11n training):
+    dataset/
+    ├── images/
+    │   └── train/          ← annotated images copied here
+    ├── labels/
+    │   └── train/          ← one .txt per image (YOLO format)
+    └── data.yaml           ← dataset config
+
+YOLO label format per line:
+    <class_id> <x_center> <y_center> <width> <height>
+    All values normalized 0..1.  Class 0 = your single target class.
+
+Controls:
+    Left-click + drag   : draw bounding box (auto-saves immediately)
+    Right-click on box  : delete that box (auto-saves immediately)
+    A / ← / Left Arrow  : previous image
+    D / → / Right Arrow : next image
+    Space               : skip — marks image as having no class (empty annotation)
+    Z                   : undo last box
+    C                   : clear all boxes from current image
+    Escape              : quit
+
+    Auto-advance checkbox: when enabled, drawing a box auto-moves to next image.
+"""
+
+import os
+import sys
+import json
+import shutil
+import tkinter as tk
+from tkinter import ttk, messagebox
+from PIL import Image, ImageTk, ImageDraw
+from pathlib import Path
+
+try:
+    from ultralytics import YOLO as _YOLO
+    _HAS_YOLO = True
+except ImportError:
+    _HAS_YOLO = False
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+BASE_DIR = Path(__file__).parent.resolve()
+CAPTURES_DIR = BASE_DIR / "captures"
+DATASET_DIR = BASE_DIR / "dataset"
+IMAGES_DIR = DATASET_DIR / "images" / "train"
+LABELS_DIR = DATASET_DIR / "labels" / "train"
+PROGRESS_FILE = DATASET_DIR / ".annotation_progress.json"
+INFERENCE_CACHE_FILE = DATASET_DIR / ".inference_cache.json"
+
+CLASS_ID = 0
+CLASS_NAME = "target"  # Change this to your actual class name
+
+# Display settings
+CANVAS_MAX_W = 1600
+CANVAS_MAX_H = 1000
+BOX_COLOR = "#00ff00"
+BOX_COLOR_SELECTED = "#ff4444"
+PREDICTION_COLOR = "#00cccc"   # teal overlay for model predictions
+BOX_WIDTH = 2
+PREDICTION_CONF_THRESH = 0.25   # minimum confidence to show prediction box
+
+# Path to trained model weights
+MODEL_WEIGHTS = BASE_DIR / "runs" / "yolo11n_target" / "weights" / "best.pt"
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+# ── Progress tracker ──────────────────────────────────────────────────────────
+class ProgressTracker:
+    """Tracks which images have been annotated to avoid re-work."""
+
+    def __init__(self, progress_file: Path):
+        self.path = progress_file
+        self.data: dict = {"annotated": {}, "skipped": []}
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            with open(self.path, "r") as f:
+                self.data = json.load(f)
+            # Ensure keys exist
+            self.data.setdefault("annotated", {})
+            self.data.setdefault("skipped", [])
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def is_annotated(self, filename: str) -> bool:
+        return filename in self.data["annotated"]
+
+    def mark_annotated(self, filename: str, num_boxes: int):
+        self.data["annotated"][filename] = {"boxes": num_boxes}
+        if filename in self.data["skipped"]:
+            self.data["skipped"].remove(filename)
+        self.save()
+
+    def unmark(self, filename: str):
+        self.data["annotated"].pop(filename, None)
+        self.save()
+
+    @property
+    def annotated_count(self) -> int:
+        return len(self.data["annotated"])
+
+
+# ── Inference Cache ───────────────────────────────────────────────────────────
+class InferenceCache:
+    """Caches model predictions per image, persisted to disk.
+
+    Invalidates automatically when the model path changes.
+    """
+
+    def __init__(self, cache_file: Path, model_path: Path):
+        self.path = cache_file
+        self.model_key = str(model_path)
+        self.predictions: dict[str, list] = {}  # filename -> [[x1,y1,x2,y2,conf], ...]
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            with open(self.path, "r") as f:
+                data = json.load(f)
+            if data.get("model_path") == self.model_key:
+                self.predictions = data.get("predictions", {})
+            else:
+                print("Model changed — inference cache invalidated.")
+                self.predictions = {}
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w") as f:
+            json.dump({
+                "model_path": self.model_key,
+                "predictions": self.predictions,
+            }, f)
+
+    def get(self, filename: str) -> list | None:
+        return self.predictions.get(filename)
+
+    def has(self, filename: str) -> bool:
+        return filename in self.predictions
+
+    def put(self, filename: str, preds: list):
+        self.predictions[filename] = preds
+
+
+# ── Annotation Tool GUI ──────────────────────────────────────────────────────
+class AnnotationTool:
+    def __init__(self):
+        # Ensure directories exist
+        CAPTURES_DIR.mkdir(parents=True, exist_ok=True)
+        IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+        LABELS_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.progress = ProgressTracker(PROGRESS_FILE)
+
+        # Gather image list from captures
+        self.image_files: list[str] = sorted(
+            f for f in os.listdir(CAPTURES_DIR)
+            if Path(f).suffix.lower() in IMAGE_EXTENSIONS
+        )
+
+        if not self.image_files:
+            print("No images found in captures/ directory.")
+            print("Run capture.py first to collect screenshots.")
+            sys.exit(1)
+
+        self.current_index = 0
+        self.boxes: list[list[float]] = []  # Each box: [x1, y1, x2, y2] in pixel coords
+        self.drawing = False
+        self.draw_start = None
+        self.current_rect_id = None
+        self.scale = 1.0  # display scale factor
+        self.img_w = 0
+        self.img_h = 0
+        self._mouse_x = 0  # last known mouse position on canvas
+        self._mouse_y = 0
+        self.predictions: list[tuple[float, float, float, float, float]] = []  # (x1,y1,x2,y2,conf)
+        self._advance_timer = None  # pending auto-advance after id
+
+        # Load YOLO model for prediction overlay
+        self.model = None
+        if _HAS_YOLO and MODEL_WEIGHTS.exists():
+            print(f"Loading model: {MODEL_WEIGHTS}")
+            self.model = _YOLO(str(MODEL_WEIGHTS))
+            print("Model loaded – predictions will appear as teal boxes")
+        else:
+            if not _HAS_YOLO:
+                print("ultralytics not installed – prediction overlay disabled")
+            elif not MODEL_WEIGHTS.exists():
+                print(f"Model not found at {MODEL_WEIGHTS} – prediction overlay disabled")
+
+        # Initialize inference cache (persists predictions to disk)
+        self.inference_cache = None
+        if self.model is not None:
+            self.inference_cache = InferenceCache(INFERENCE_CACHE_FILE, MODEL_WEIGHTS)
+
+        self._build_gui()
+
+        # Pre-infer all images (shows progress bar, uses cache for already-done)
+        if self.model is not None:
+            self._run_pre_inference()
+
+        self._load_image()
+
+    def _run_pre_inference(self):
+        """Run model inference on unannotated images not yet in cache, with a progress bar."""
+        to_infer = [
+            f for f in self.image_files
+            if not self.inference_cache.has(f) and not self.progress.is_annotated(f)
+        ]
+        if not to_infer:
+            print(f"Inference cache up-to-date ({len(self.image_files)} images cached).")
+            return
+
+        total = len(to_infer)
+        print(f"Pre-inferencing {total} images...")
+
+        # Progress dialog
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("Pre-inference")
+        progress_win.configure(bg="#2b2b2b")
+        progress_win.geometry("520x130")
+        progress_win.resizable(False, False)
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+
+        tk.Label(
+            progress_win, text="Running AI inference on unannotated images...",
+            font=("Consolas", 11), bg="#2b2b2b", fg="#ffffff",
+        ).pack(pady=(15, 5))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress_bar = ttk.Progressbar(
+            progress_win, variable=progress_var, maximum=total, length=460,
+        )
+        progress_bar.pack(pady=5)
+
+        status_label = tk.Label(
+            progress_win, text=f"0 / {total}",
+            font=("Consolas", 10), bg="#2b2b2b", fg="#aaaaaa",
+        )
+        status_label.pack()
+
+        for idx, fname in enumerate(to_infer):
+            filepath = CAPTURES_DIR / fname
+            results = self.model(filepath, imgsz=640, conf=PREDICTION_CONF_THRESH, verbose=False)
+            preds = []
+            for r in results:
+                for box in r.boxes:
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    conf = box.conf[0].item()
+                    preds.append([x1, y1, x2, y2, conf])
+            self.inference_cache.put(fname, preds)
+
+            progress_var.set(idx + 1)
+            status_label.config(text=f"{idx + 1} / {total}")
+            progress_win.update()
+
+            # Periodic disk save every 100 images
+            if (idx + 1) % 100 == 0:
+                self.inference_cache.save()
+
+        self.inference_cache.save()
+        progress_win.destroy()
+        print(f"Pre-inference complete — {total} images processed.")
+
+    def _build_gui(self):
+        self.root = tk.Tk()
+        self.root.title("YOLO Annotation Tool")
+        self.root.configure(bg="#2b2b2b")
+
+        # Top bar
+        top_frame = tk.Frame(self.root, bg="#1e1e1e", padx=10, pady=6)
+        top_frame.pack(fill=tk.X)
+
+        self.file_label = tk.Label(
+            top_frame, text="", font=("Consolas", 11), bg="#1e1e1e", fg="#ffffff"
+        )
+        self.file_label.pack(side=tk.LEFT)
+
+        self.status_label = tk.Label(
+            top_frame, text="", font=("Consolas", 10), bg="#1e1e1e", fg="#aaaaaa"
+        )
+        self.status_label.pack(side=tk.RIGHT)
+
+        self.annotated_badge = tk.Label(
+            top_frame, text="", font=("Consolas", 10, "bold"), bg="#1e1e1e", fg="#00ff00"
+        )
+        self.annotated_badge.pack(side=tk.RIGHT, padx=(0, 15))
+
+        # Canvas
+        canvas_frame = tk.Frame(self.root, bg="#2b2b2b")
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        self.canvas = tk.Canvas(
+            canvas_frame, bg="#000000", cursor="crosshair",
+            highlightthickness=0
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+
+        # Bottom bar with buttons
+        bottom_frame = tk.Frame(self.root, bg="#1e1e1e", padx=10, pady=6)
+        bottom_frame.pack(fill=tk.X)
+
+        btn_style = {"font": ("Consolas", 10), "bg": "#3c3c3c", "fg": "#ffffff",
+                      "activebackground": "#555555", "activeforeground": "#ffffff",
+                      "relief": tk.FLAT, "padx": 12, "pady": 4}
+
+        tk.Button(bottom_frame, text="◀ Prev (A)", command=self._prev_image, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(bottom_frame, text="Next (D) ▶", command=self._next_image, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(bottom_frame, text="Skip (Space)", command=self._skip_no_class, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(bottom_frame, text="Undo Box (Z)", command=self._undo_last_box, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(bottom_frame, text="Clear All (C)", command=self._clear_boxes, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(bottom_frame, text="Accept AI (Enter)", command=self._accept_predictions, **btn_style).pack(side=tk.LEFT, padx=2)
+        tk.Button(bottom_frame, text="Bulk (B)", command=self._open_bulk, **btn_style).pack(side=tk.LEFT, padx=2)
+
+        # Auto-advance toggle
+        self.auto_advance = tk.BooleanVar(value=True)
+        self.auto_advance_cb = tk.Checkbutton(
+            bottom_frame, text="Auto-advance", variable=self.auto_advance,
+            font=("Consolas", 10), bg="#1e1e1e", fg="#ffffff",
+            selectcolor="#3c3c3c", activebackground="#1e1e1e", activeforeground="#ffffff",
+        )
+        self.auto_advance_cb.pack(side=tk.LEFT, padx=(20, 2))
+
+        self.counter_label = tk.Label(
+            bottom_frame, text="", font=("Consolas", 10), bg="#1e1e1e", fg="#aaaaaa"
+        )
+        self.counter_label.pack(side=tk.RIGHT)
+
+        self.box_count_label = tk.Label(
+            bottom_frame, text="Boxes: 0", font=("Consolas", 10), bg="#1e1e1e", fg="#ffaa00"
+        )
+        self.box_count_label.pack(side=tk.RIGHT, padx=(0, 15))
+
+        # Mouse bindings
+        self.canvas.bind("<ButtonPress-1>", self._on_mouse_down)
+        self.canvas.bind("<B1-Motion>", self._on_mouse_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_mouse_up)
+        self.canvas.bind("<ButtonPress-3>", self._on_right_click)
+
+        # Key bindings
+        self.root.bind("<KeyPress-a>", lambda e: self._prev_image())
+        self.root.bind("<KeyPress-d>", lambda e: self._next_image())
+        self.root.bind("<KeyPress-A>", lambda e: self._prev_image())
+        self.root.bind("<KeyPress-D>", lambda e: self._next_image())
+        self.root.bind("<Left>", lambda e: self._prev_image())
+        self.root.bind("<Right>", lambda e: self._next_image())
+        self.root.bind("<space>", lambda e: self._skip_no_class())
+        self.root.bind("<KeyPress-z>", lambda e: self._undo_last_box())
+        self.root.bind("<KeyPress-c>", lambda e: self._clear_boxes())
+        self.root.bind("<KeyPress-Z>", lambda e: self._undo_last_box())
+        self.root.bind("<KeyPress-C>", lambda e: self._clear_boxes())
+        self.root.bind("<Return>", lambda e: self._accept_predictions())
+        self.root.bind("<Shift_L>", lambda e: self._accept_hovered_prediction())
+        self.root.bind("<Shift_R>", lambda e: self._accept_hovered_prediction())
+        self.root.bind("<KeyPress-b>", lambda e: self._open_bulk())
+        self.root.bind("<KeyPress-B>", lambda e: self._open_bulk())
+        self.root.bind("<Escape>", lambda e: self.root.quit())
+
+        # Keep keyboard focus on root so key bindings always fire
+        self.root.focus_set()
+        self.canvas.bind("<Motion>", self._on_mouse_move)
+        self.canvas.bind("<ButtonPress-1>", self._on_mouse_down_refocus)
+
+    def _load_image(self):
+        """Load the current image and any existing annotations."""
+        filename = self.image_files[self.current_index]
+        filepath = CAPTURES_DIR / filename
+
+        # Load image with PIL
+        pil_img = Image.open(filepath)
+        self.img_w, self.img_h = pil_img.size
+
+        # Compute scale to fit canvas (allows upscaling for small images)
+        self.root.update_idletasks()
+        scale_w = CANVAS_MAX_W / self.img_w
+        scale_h = CANVAS_MAX_H / self.img_h
+        self.scale = min(scale_w, scale_h)
+
+        display_w = int(self.img_w * self.scale)
+        display_h = int(self.img_h * self.scale)
+
+        # Resize for display (up or down)
+        if self.scale != 1.0:
+            display_img = pil_img.resize((display_w, display_h), Image.LANCZOS)
+        else:
+            display_img = pil_img
+
+        self.tk_img = ImageTk.PhotoImage(display_img)
+
+        # Configure canvas size
+        self.canvas.config(width=display_w, height=display_h)
+
+        # Load existing annotations if any
+        self.boxes = []
+        label_path = LABELS_DIR / (Path(filename).stem + ".txt")
+        if label_path.exists():
+            self._load_yolo_labels(label_path)
+
+        # Use cached predictions for overlay
+        self.predictions = []
+        if self.inference_cache is not None:
+            cached = self.inference_cache.get(filename)
+            if cached:
+                self.predictions = [tuple(p) for p in cached]
+
+        # Update display
+        self._redraw()
+        self._update_labels()
+
+    def _load_yolo_labels(self, label_path: Path):
+        """Load YOLO format labels back into pixel coordinates."""
+        with open(label_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) != 5:
+                    continue
+                _, xc, yc, w, h = map(float, parts)
+                # Convert normalized center+size to pixel x1,y1,x2,y2
+                x1 = (xc - w / 2) * self.img_w
+                y1 = (yc - h / 2) * self.img_h
+                x2 = (xc + w / 2) * self.img_w
+                y2 = (yc + h / 2) * self.img_h
+                self.boxes.append([x1, y1, x2, y2])
+
+    def _redraw(self):
+        """Redraw the canvas with current image and all boxes."""
+        self.canvas.delete("all")
+        self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tk_img)
+
+        # Draw teal prediction boxes (model overlay, display-only)
+        for j, pred in enumerate(self.predictions):
+            px1, py1, px2, py2, conf = pred
+            px1, py1, px2, py2 = [c * self.scale for c in (px1, py1, px2, py2)]
+            self.canvas.create_rectangle(
+                px1, py1, px2, py2,
+                outline=PREDICTION_COLOR, width=1, dash=(6, 3),
+                tags=f"pred_{j}"
+            )
+            self.canvas.create_text(
+                px1 + 3, py1 - 3, anchor=tk.SW,
+                text=f"{conf:.0%}", font=("Consolas", 8),
+                fill=PREDICTION_COLOR, tags=f"predlbl_{j}"
+            )
+
+        # Draw annotation boxes (green, these are the real labels)
+        for i, box in enumerate(self.boxes):
+            x1, y1, x2, y2 = [c * self.scale for c in box]
+            self.canvas.create_rectangle(
+                x1, y1, x2, y2,
+                outline=BOX_COLOR, width=BOX_WIDTH, tags=f"box_{i}"
+            )
+            # Draw small label
+            self.canvas.create_text(
+                x1 + 3, y1 - 3, anchor=tk.SW,
+                text=f"{CLASS_NAME}", font=("Consolas", 9),
+                fill=BOX_COLOR, tags=f"label_{i}"
+            )
+
+        self.box_count_label.config(text=f"Boxes: {len(self.boxes)}")
+
+    def _update_labels(self):
+        """Update the info labels."""
+        filename = self.image_files[self.current_index]
+        is_ann = self.progress.is_annotated(filename)
+
+        self.file_label.config(text=f"{filename}  ({self.img_w}x{self.img_h})")
+
+        if is_ann:
+            self.annotated_badge.config(text="[ANNOTATED]", fg="#00ff00")
+        else:
+            self.annotated_badge.config(text="[NEW]", fg="#ffaa00")
+
+        total = len(self.image_files)
+        done = self.progress.annotated_count
+        self.status_label.config(text=f"{done}/{total} annotated")
+        self.counter_label.config(text=f"Image {self.current_index + 1} / {total}")
+
+    # ── Mouse handlers ────────────────────────────────────────────────────────
+
+    def _on_mouse_move(self, event):
+        """Track mouse position for hover-based actions."""
+        self._mouse_x = event.x
+        self._mouse_y = event.y
+
+    def _on_mouse_down_refocus(self, event):
+        """Wrapper: handle mouse-down then return focus to root for key binds."""
+        self._on_mouse_down(event)
+        self.root.focus_set()
+
+    def _on_mouse_down(self, event):
+        self.drawing = True
+        self.draw_start = (event.x, event.y)
+        self.current_rect_id = self.canvas.create_rectangle(
+            event.x, event.y, event.x, event.y,
+            outline=BOX_COLOR_SELECTED, width=BOX_WIDTH, dash=(4, 2)
+        )
+
+    def _on_mouse_drag(self, event):
+        if self.drawing and self.current_rect_id:
+            self.canvas.coords(
+                self.current_rect_id,
+                self.draw_start[0], self.draw_start[1], event.x, event.y
+            )
+
+    def _on_mouse_up(self, event):
+        if not self.drawing:
+            return
+        self.drawing = False
+
+        x1_d, y1_d = self.draw_start
+        x2_d, y2_d = event.x, event.y
+
+        # Remove the temporary drawing rect
+        if self.current_rect_id:
+            self.canvas.delete(self.current_rect_id)
+            self.current_rect_id = None
+
+        # Convert display coords to image coords
+        x1 = min(x1_d, x2_d) / self.scale
+        y1 = min(y1_d, y2_d) / self.scale
+        x2 = max(x1_d, x2_d) / self.scale
+        y2 = max(y1_d, y2_d) / self.scale
+
+        # Clamp to image bounds
+        x1 = max(0, min(x1, self.img_w))
+        y1 = max(0, min(y1, self.img_h))
+        x2 = max(0, min(x2, self.img_w))
+        y2 = max(0, min(y2, self.img_h))
+
+        # Minimum box size filter (ignore tiny accidental clicks)
+        if abs(x2 - x1) < 5 or abs(y2 - y1) < 5:
+            return
+
+        self.boxes.append([x1, y1, x2, y2])
+        self._auto_save()
+        self._redraw()
+
+        # Auto-advance to next image after drawing a box
+        if self.auto_advance.get():
+            self._schedule_advance()
+
+    def _on_right_click(self, event):
+        """Delete the box closest to the right-click point."""
+        if not self.boxes:
+            return
+
+        # Find which box the click is inside (display coords → image coords)
+        click_x = event.x / self.scale
+        click_y = event.y / self.scale
+
+        for i, box in enumerate(self.boxes):
+            x1, y1, x2, y2 = box
+            if x1 <= click_x <= x2 and y1 <= click_y <= y2:
+                self.boxes.pop(i)
+                self._auto_save()
+                self._redraw()
+                return
+
+    # ── Actions ───────────────────────────────────────────────────────────────
+
+    def _auto_save(self):
+        """Immediately save current annotations to disk. Called on every change."""
+        filename = self.image_files[self.current_index]
+        stem = Path(filename).stem
+
+        # Copy image to dataset
+        src = CAPTURES_DIR / filename
+        dst = IMAGES_DIR / filename
+        shutil.copy2(src, dst)
+
+        # Write YOLO label file (empty file = no class present)
+        label_path = LABELS_DIR / (stem + ".txt")
+        with open(label_path, "w") as f:
+            for box in self.boxes:
+                x1, y1, x2, y2 = box
+                # Convert pixel coords to normalized center + size
+                xc = ((x1 + x2) / 2) / self.img_w
+                yc = ((y1 + y2) / 2) / self.img_h
+                w = (x2 - x1) / self.img_w
+                h = (y2 - y1) / self.img_h
+                f.write(f"{CLASS_ID} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
+
+        # Track progress
+        self.progress.mark_annotated(filename, len(self.boxes))
+        self._update_labels()
+
+    def _schedule_advance(self):
+        """Schedule an auto-advance, cancelling any pending one first."""
+        self._cancel_advance()
+        self._advance_timer = self.root.after(150, self._fire_advance)
+
+    def _cancel_advance(self):
+        """Cancel any pending auto-advance timer."""
+        if self._advance_timer is not None:
+            self.root.after_cancel(self._advance_timer)
+            self._advance_timer = None
+
+    def _fire_advance(self):
+        """Auto-advance callback — skip to next unannotated image."""
+        self._advance_timer = None
+        self._skip_to_unannotated()
+
+    def _prev_image(self):
+        self._cancel_advance()
+        if self.current_index > 0:
+            self.current_index -= 1
+            self._load_image()
+
+    def _next_image(self):
+        self._cancel_advance()
+        if self.current_index < len(self.image_files) - 1:
+            self.current_index += 1
+            self._load_image()
+
+    def _skip_no_class(self):
+        """Mark current image as having no class (save empty annotation) and advance."""
+        self.boxes.clear()
+        self._auto_save()
+        self._redraw()
+        self._skip_to_unannotated()
+
+    def _undo_last_box(self):
+        if self.boxes:
+            self.boxes.pop()
+            self._auto_save()
+            self._redraw()
+
+    def _clear_boxes(self):
+        self.boxes.clear()
+        self._auto_save()
+        self._redraw()
+
+    def _accept_predictions(self):
+        """Accept all AI prediction boxes as annotation labels and advance."""
+        if not self.predictions:
+            return
+        for x1, y1, x2, y2, _conf in self.predictions:
+            self.boxes.append([x1, y1, x2, y2])
+        self._auto_save()
+        self._redraw()
+        if self.auto_advance.get():
+            self._schedule_advance()
+
+    def _accept_hovered_prediction(self):
+        """Accept the single AI prediction box under the mouse cursor and advance."""
+        if not self.predictions:
+            return
+        # Convert mouse display coords to image coords
+        mx = self._mouse_x / self.scale
+        my = self._mouse_y / self.scale
+        for x1, y1, x2, y2, _conf in self.predictions:
+            if x1 <= mx <= x2 and y1 <= my <= y2:
+                self.boxes.append([x1, y1, x2, y2])
+                self._auto_save()
+                self._redraw()
+                if self.auto_advance.get():
+                    self._schedule_advance()
+                return
+
+    def _unmark_annotation(self):
+        """Remove the current image from the dataset (un-annotate)."""
+        filename = self.image_files[self.current_index]
+        stem = Path(filename).stem
+
+        # Remove from dataset
+        img_dst = IMAGES_DIR / filename
+        label_dst = LABELS_DIR / (stem + ".txt")
+        if img_dst.exists():
+            img_dst.unlink()
+        if label_dst.exists():
+            label_dst.unlink()
+
+        self.progress.unmark(filename)
+        self.boxes.clear()
+        self._redraw()
+        self._update_labels()
+
+    def _skip_to_unannotated(self):
+        """Jump to the next unannotated image."""
+        start = self.current_index + 1
+        for i in range(start, len(self.image_files)):
+            if not self.progress.is_annotated(self.image_files[i]):
+                self.current_index = i
+                self._load_image()
+                return
+        for i in range(0, start):
+            if not self.progress.is_annotated(self.image_files[i]):
+                self.current_index = i
+                self._load_image()
+                return
+        messagebox.showinfo("Done", "All images have been annotated!")
+
+    def _open_bulk(self):
+        """Open the bulk annotation window."""
+        if self.model is None or self.inference_cache is None:
+            messagebox.showwarning("No Model", "No YOLO model loaded — bulk annotation requires a trained model.")
+            return
+        BulkAnnotationWindow(self)
+
+    def run(self):
+        # Find first unannotated image
+        for i, f in enumerate(self.image_files):
+            if not self.progress.is_annotated(f):
+                self.current_index = i
+                self._load_image()
+                break
+
+        self.root.mainloop()
+
+
+# ── Bulk Annotation Window ────────────────────────────────────────────────────
+BULK_GRID_COLS = 4
+BULK_GRID_ROWS = 4
+BULK_GRID_SIZE = BULK_GRID_COLS * BULK_GRID_ROWS  # 16
+
+BULK_PRESETS = [
+    "All detections",
+    "High confidence (>80%)",
+    "Medium confidence (50-80%)",
+    "Low confidence (25-50%)",
+    "Single detection",
+    "Multiple detections",
+    "Custom range",
+]
+
+
+class BulkAnnotationWindow:
+    """Full-screen 4x4 grid for rapid bulk accept/reject annotation.
+
+    Uses cached AI predictions — no live inference needed.
+
+    Left-click  = accept (save AI boxes as annotations, cell refills)
+    Right-click = reject (skip, image stays unannotated for manual review, cell refills)
+    """
+
+    def __init__(self, parent_tool: AnnotationTool):
+        self.parent = parent_tool
+        self.progress = parent_tool.progress
+        self.cache = parent_tool.inference_cache
+
+        self.win = tk.Toplevel(parent_tool.root)
+        self.win.title("Bulk Annotation")
+        self.win.configure(bg="#2b2b2b")
+        self.win.state("zoomed")  # maximize on Windows
+        self.win.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Compute thumbnail size based on screen real estate
+        screen_w = self.win.winfo_screenwidth()
+        screen_h = self.win.winfo_screenheight()
+        self.thumb_w = (screen_w - 60) // BULK_GRID_COLS - 14
+        self.thumb_h = (screen_h - 180) // BULK_GRID_ROWS - 36
+
+        # Queue state
+        self._queue: list[str] = []
+        self._queue_idx = 0
+        self._accepted = 0
+        self._rejected_count = 0
+        self._undo_stack: list[dict] = []  # each entry: {action, fname, cell_idx, preds}
+
+        self._build_ui()
+        self._apply_filter()
+
+    def _build_ui(self):
+        # ── Top bar ───────────────────────────────────────────────────────
+        top = tk.Frame(self.win, bg="#1e1e1e", padx=10, pady=6)
+        top.pack(fill=tk.X)
+
+        btn_style = {"font": ("Consolas", 10), "bg": "#3c3c3c", "fg": "#ffffff",
+                      "activebackground": "#555555", "activeforeground": "#ffffff",
+                      "relief": tk.FLAT, "padx": 8, "pady": 3}
+
+        tk.Label(top, text="Filter:", font=("Consolas", 10),
+                 bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT)
+
+        self.filter_var = tk.StringVar(value="All detections")
+        filter_menu = ttk.Combobox(
+            top, textvariable=self.filter_var, state="readonly",
+            values=BULK_PRESETS, width=25, font=("Consolas", 10),
+        )
+        filter_menu.pack(side=tk.LEFT, padx=(5, 15))
+        filter_menu.bind("<<ComboboxSelected>>", lambda e: self._on_preset_change())
+
+        # Custom range inputs (always visible)
+        tk.Label(top, text="Range:", font=("Consolas", 10),
+                 bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT, padx=(10, 0))
+        self.custom_min_var = tk.StringVar(value="60")
+        tk.Entry(top, textvariable=self.custom_min_var, width=5,
+                 font=("Consolas", 10), bg="#333333", fg="#ffffff",
+                 insertbackground="#ffffff").pack(side=tk.LEFT, padx=2)
+        tk.Label(top, text="% to", font=("Consolas", 10),
+                 bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT)
+        self.custom_max_var = tk.StringVar(value="100")
+        tk.Entry(top, textvariable=self.custom_max_var, width=5,
+                 font=("Consolas", 10), bg="#333333", fg="#ffffff",
+                 insertbackground="#ffffff").pack(side=tk.LEFT, padx=2)
+        tk.Label(top, text="%", font=("Consolas", 10),
+                 bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT)
+        tk.Button(top, text="Apply", command=self._apply_custom, **btn_style).pack(
+            side=tk.LEFT, padx=(5, 0))
+
+        self.stats_label = tk.Label(
+            top, text="", font=("Consolas", 10), bg="#1e1e1e", fg="#aaaaaa",
+        )
+        self.stats_label.pack(side=tk.RIGHT)
+
+        # ── Legend ────────────────────────────────────────────────────────
+        legend = tk.Frame(self.win, bg="#1e1e1e", padx=10, pady=3)
+        legend.pack(fill=tk.X)
+        tk.Label(
+            legend,
+            text="Left-click = Accept    |    Right-click = Reject    |    Ctrl+Z = Undo",
+            font=("Consolas", 9), bg="#1e1e1e", fg="#888888",
+        ).pack(side=tk.LEFT)
+
+        btn_undo_style = {"font": ("Consolas", 10), "bg": "#3c3c3c", "fg": "#ffffff",
+                          "activebackground": "#555555", "activeforeground": "#ffffff",
+                          "relief": tk.FLAT, "padx": 8, "pady": 3}
+        tk.Button(legend, text="Undo (Ctrl+Z)", command=self._undo, **btn_undo_style).pack(
+            side=tk.RIGHT, padx=2)
+
+        self.win.bind("<Control-z>", lambda e: self._undo())
+        self.win.bind("<Control-Z>", lambda e: self._undo())
+
+        # ── Grid ──────────────────────────────────────────────────────────
+        self.grid_frame = tk.Frame(self.win, bg="#2b2b2b", padx=5, pady=5)
+        self.grid_frame.pack(fill=tk.BOTH, expand=True)
+
+        self._cells: list[dict] = []
+        for row in range(BULK_GRID_ROWS):
+            self.grid_frame.rowconfigure(row, weight=1)
+            for col in range(BULK_GRID_COLS):
+                self.grid_frame.columnconfigure(col, weight=1)
+
+                cell_frame = tk.Frame(
+                    self.grid_frame, bg="#1a1a1a",
+                    highlightbackground="#333", highlightthickness=1,
+                )
+                cell_frame.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+
+                cvs = tk.Canvas(
+                    cell_frame, bg="#000000", highlightthickness=0,
+                    cursor="hand2",
+                )
+                cvs.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+
+                lbl = tk.Label(
+                    cell_frame, text="", font=("Consolas", 8),
+                    bg="#1a1a1a", fg="#aaaaaa",
+                )
+                lbl.pack()
+
+                self._cells.append({
+                    "frame": cell_frame, "canvas": cvs, "label": lbl,
+                    "filename": None, "predictions": [], "tk_img": None,
+                })
+
+    # ── Filter logic ──────────────────────────────────────────────────────
+
+    def _get_filter_params(self):
+        """Return (min_conf, max_conf, det_count) for the active filter.
+
+        det_count: None = any, 1 = exactly one, -1 = two or more.
+        """
+        preset = self.filter_var.get()
+        if preset == "High confidence (>80%)":
+            return (0.80, 1.0, None)
+        elif preset == "Medium confidence (50-80%)":
+            return (0.50, 0.80, None)
+        elif preset == "Low confidence (25-50%)":
+            return (0.25, 0.50, None)
+        elif preset == "Single detection":
+            return (PREDICTION_CONF_THRESH, 1.0, 1)
+        elif preset == "Multiple detections":
+            return (PREDICTION_CONF_THRESH, 1.0, -1)
+        elif preset == "Custom range":
+            return self._parse_custom_range()
+        # "All detections" or fallback
+        return (PREDICTION_CONF_THRESH, 1.0, None)
+
+    def _parse_custom_range(self):
+        try:
+            mn = float(self.custom_min_var.get()) / 100.0
+        except ValueError:
+            mn = 0.25
+        try:
+            mx = float(self.custom_max_var.get()) / 100.0
+        except ValueError:
+            mx = 1.0
+        return (mn, mx, None)
+
+    def _build_queue(self) -> list[str]:
+        """Build filtered candidate list from cached predictions."""
+        min_conf, max_conf, det_count = self._get_filter_params()
+        queue = []
+        for fname in self.parent.image_files:
+            if self.progress.is_annotated(fname):
+                continue
+            cached = self.cache.get(fname)
+            if not cached or len(cached) == 0:
+                continue
+            # Detection count filter
+            num_det = len(cached)
+            if det_count == 1 and num_det != 1:
+                continue
+            if det_count == -1 and num_det < 2:
+                continue
+            # Confidence filter on highest-confidence detection
+            max_c = max(p[4] for p in cached)
+            if max_c < min_conf or max_c > max_conf:
+                continue
+            queue.append(fname)
+        return queue
+
+    def _on_preset_change(self):
+        if self.filter_var.get() != "Custom range":
+            self._apply_filter()
+
+    def _apply_custom(self):
+        self.filter_var.set("Custom range")
+        self._apply_filter()
+
+    def _apply_filter(self):
+        """Rebuild the queue and fill the entire grid."""
+        self._queue = self._build_queue()
+        self._queue_idx = 0
+        self._accepted = 0
+        self._rejected_count = 0
+        for i in range(BULK_GRID_SIZE):
+            self._fill_cell(i)
+        self._update_stats()
+
+    # ── Cell display ──────────────────────────────────────────────────────
+
+    def _fill_cell(self, cell_idx: int):
+        """Pop the next image from the queue into a grid cell."""
+        cell = self._cells[cell_idx]
+        cvs = cell["canvas"]
+        lbl = cell["label"]
+
+        cvs.unbind("<Button-1>")
+        cvs.unbind("<Button-3>")
+
+        if self._queue_idx >= len(self._queue):
+            # No more images for this cell
+            cvs.delete("all")
+            cvs.config(bg="#111111")
+            lbl.config(text="")
+            cell["filename"] = None
+            cell["predictions"] = []
+            cell["tk_img"] = None
+            return
+
+        fname = self._queue[self._queue_idx]
+        self._queue_idx += 1
+        cell["filename"] = fname
+
+        filepath = CAPTURES_DIR / fname
+        pil_img = Image.open(filepath)
+        img_w, img_h = pil_img.size
+
+        # Get cached predictions
+        cached = self.cache.get(fname) or []
+        preds = [tuple(p) for p in cached]
+        cell["predictions"] = preds
+
+        # Draw prediction boxes on a copy
+        draw_img = pil_img.copy()
+        draw = ImageDraw.Draw(draw_img)
+        for x1, y1, x2, y2, conf in preds:
+            draw.rectangle([x1, y1, x2, y2], outline=(0, 204, 204), width=2)
+            draw.text((x1 + 2, y1 - 12), f"{conf:.0%}", fill=(0, 204, 204))
+
+        # Scale to thumbnail
+        scale = min(self.thumb_w / img_w, self.thumb_h / img_h)
+        tw = max(1, int(img_w * scale))
+        th = max(1, int(img_h * scale))
+        thumb = draw_img.resize((tw, th), Image.LANCZOS)
+
+        tk_img = ImageTk.PhotoImage(thumb)
+        cell["tk_img"] = tk_img  # prevent GC
+
+        cvs.config(width=tw, height=th)
+        cvs.delete("all")
+        cvs.create_image(0, 0, anchor=tk.NW, image=tk_img)
+
+        max_conf = max((p[4] for p in preds), default=0)
+        lbl.config(text=f"{fname}  ({len(preds)} det, {max_conf:.0%})")
+        cell["frame"].config(highlightbackground="#333", highlightthickness=1)
+
+        # Bind accept / reject
+        cvs.bind("<Button-1>", lambda e, ci=cell_idx: self._accept_cell(ci))
+        cvs.bind("<Button-3>", lambda e, ci=cell_idx: self._reject_cell(ci))
+
+    # ── Accept / Reject ───────────────────────────────────────────────────
+
+    def _accept_cell(self, cell_idx: int):
+        """Accept AI predictions for this cell — save as YOLO annotation."""
+        cell = self._cells[cell_idx]
+        fname = cell["filename"]
+        if not fname:
+            return
+        preds = cell["predictions"]
+        if not preds:
+            return
+
+        filepath = CAPTURES_DIR / fname
+        pil_img = Image.open(filepath)
+        img_w, img_h = pil_img.size
+        stem = Path(fname).stem
+
+        # Copy image to dataset
+        shutil.copy2(filepath, IMAGES_DIR / fname)
+
+        # Write YOLO label file
+        label_path = LABELS_DIR / (stem + ".txt")
+        with open(label_path, "w") as f:
+            for x1, y1, x2, y2, _conf in preds:
+                xc = ((x1 + x2) / 2) / img_w
+                yc = ((y1 + y2) / 2) / img_h
+                w = (x2 - x1) / img_w
+                h = (y2 - y1) / img_h
+                f.write(f"{CLASS_ID} {xc:.6f} {yc:.6f} {w:.6f} {h:.6f}\n")
+
+        self.progress.mark_annotated(fname, len(preds))
+        self._accepted += 1
+        self._undo_stack.append({
+            "action": "accept", "fname": fname, "cell_idx": cell_idx,
+        })
+
+        # Flash green then refill
+        cell["frame"].config(highlightbackground="#00ff00", highlightthickness=3)
+        self.win.after(120, lambda: self._refill_cell(cell_idx))
+
+    def _reject_cell(self, cell_idx: int):
+        """Reject — image stays unannotated, cell refills with next match."""
+        cell = self._cells[cell_idx]
+        if not cell["filename"]:
+            return
+        self._rejected_count += 1
+        self._undo_stack.append({
+            "action": "reject", "fname": cell["filename"], "cell_idx": cell_idx,
+        })
+
+        # Flash red then refill
+        cell["frame"].config(highlightbackground="#ff4444", highlightthickness=3)
+        self.win.after(120, lambda: self._refill_cell(cell_idx))
+
+    def _undo(self):
+        """Undo the last accept or reject action."""
+        if not self._undo_stack:
+            return
+        entry = self._undo_stack.pop()
+        fname = entry["fname"]
+        cell_idx = entry["cell_idx"]
+
+        if entry["action"] == "accept":
+            # Remove annotation from dataset
+            stem = Path(fname).stem
+            img_dst = IMAGES_DIR / fname
+            label_dst = LABELS_DIR / (stem + ".txt")
+            if img_dst.exists():
+                img_dst.unlink()
+            if label_dst.exists():
+                label_dst.unlink()
+            self.progress.unmark(fname)
+            self._accepted -= 1
+        elif entry["action"] == "reject":
+            self._rejected_count -= 1
+
+        # Put the image back into the cell so the user can re-decide
+        # Decrement queue index if the cell currently has a queued image
+        # (push back the image that replaced it)
+        current_fname = self._cells[cell_idx]["filename"]
+        if current_fname is not None:
+            self._queue_idx -= 1
+
+        # Override the cell with the undone image
+        self._cells[cell_idx]["filename"] = fname
+        self._show_image_in_cell(cell_idx, fname)
+        self._update_stats()
+
+    def _show_image_in_cell(self, cell_idx: int, fname: str):
+        """Display a specific image in a cell (used by undo)."""
+        cell = self._cells[cell_idx]
+        cvs = cell["canvas"]
+        lbl = cell["label"]
+
+        filepath = CAPTURES_DIR / fname
+        pil_img = Image.open(filepath)
+        img_w, img_h = pil_img.size
+
+        cached = self.cache.get(fname) or []
+        preds = [tuple(p) for p in cached]
+        cell["predictions"] = preds
+
+        draw_img = pil_img.copy()
+        draw = ImageDraw.Draw(draw_img)
+        for x1, y1, x2, y2, conf in preds:
+            draw.rectangle([x1, y1, x2, y2], outline=(0, 204, 204), width=2)
+            draw.text((x1 + 2, y1 - 12), f"{conf:.0%}", fill=(0, 204, 204))
+
+        scale = min(self.thumb_w / img_w, self.thumb_h / img_h)
+        tw = max(1, int(img_w * scale))
+        th = max(1, int(img_h * scale))
+        thumb = draw_img.resize((tw, th), Image.LANCZOS)
+
+        tk_img = ImageTk.PhotoImage(thumb)
+        cell["tk_img"] = tk_img
+
+        cvs.config(width=tw, height=th)
+        cvs.delete("all")
+        cvs.create_image(0, 0, anchor=tk.NW, image=tk_img)
+
+        max_conf = max((p[4] for p in preds), default=0)
+        lbl.config(text=f"{fname}  ({len(preds)} det, {max_conf:.0%})")
+        cell["frame"].config(highlightbackground="#ffaa00", highlightthickness=2)
+
+        cvs.bind("<Button-1>", lambda e, ci=cell_idx: self._accept_cell(ci))
+        cvs.bind("<Button-3>", lambda e, ci=cell_idx: self._reject_cell(ci))
+
+    def _refill_cell(self, cell_idx: int):
+        self._fill_cell(cell_idx)
+        self._update_stats()
+
+    def _update_stats(self):
+        remaining = len(self._queue) - self._queue_idx
+        total = len(self._queue)
+        self.stats_label.config(
+            text=f"{total} matches  |  {remaining} remaining  |  "
+                 f"Accepted: {self._accepted}  |  Skipped: {self._rejected_count}"
+        )
+
+    def _on_close(self):
+        # Refresh parent's labels in case annotations changed
+        self.parent._update_labels()
+        self.win.destroy()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    print(f"YOLO Annotation Tool")
+    print(f"  Captures dir : {CAPTURES_DIR}")
+    print(f"  Dataset dir  : {DATASET_DIR}")
+    print(f"  Class        : {CLASS_ID} = '{CLASS_NAME}'")
+    print()
+    print("Controls:")
+    print("  LMB drag     = draw box")
+    print("  RMB on box   = delete box")
+    print("  A/D or ←/→   = prev/next image")
+    print("  Space        = skip (no class in image)")
+    print("  Z            = undo last box")
+    print("  C            = clear all boxes")
+    print("  Enter        = accept AI prediction boxes")
+    print("  B            = open bulk annotation window")
+    print("  Esc          = quit")
+    print("  Auto-save is always on — every change saves immediately")
+    print()
+
+    tool = AnnotationTool()
+    tool.run()
+
+
+if __name__ == "__main__":
+    main()
