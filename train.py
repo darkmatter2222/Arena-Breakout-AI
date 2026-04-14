@@ -1,6 +1,10 @@
 """
 YOLO11n training script for single-class detection.
 RTX 5090 (32 GB VRAM) · CUDA 12.8 · Ultralytics 8.x
+
+v4 hyperparams: reverted loss weights to defaults (v3 rebalancing regressed
+mAP@0.5:0.95), kept cutmix/perspective/lr0 from v3, added stratified
+negative downsampling in training split (53% → 35% negatives).
 """
 
 import random
@@ -11,8 +15,8 @@ from pathlib import Path
 import torch
 from ultralytics import YOLO
 
-# ── cuDNN stability ──────────────────────────────────────────────────────
-torch.backends.cudnn.benchmark = False
+# ── cuDNN tuning ─────────────────────────────────────────────────────────
+torch.backends.cudnn.benchmark = True   # constant input size → safe & faster
 torch.backends.cudnn.deterministic = True
 
 
@@ -27,20 +31,22 @@ MODELS_DIR  = ROOT / "models"
 
 # ── training hyper-parameters ────────────────────────────────────────────
 MODEL_NAME  = "yolo11n.pt"        # nano – fastest, good for real-time
-EPOCHS      = 150
-IMGSZ       = 640                 # standard YOLO input size
-BATCH_SIZE  = 16                  # 16 avoids cuDNN OOM with this dataset
-PATIENCE    = 30                  # early-stop if no improvement for N epochs
-VAL_SPLIT   = 0.15               # 15% held out for validation
-SEED        = 42
-WORKERS     = 8
+EPOCHS      = 300                 # doubled — previous run never early-stopped
+IMGSZ       = 800                 # up from 640 — exploit 32 GB VRAM for tighter boxes
+BATCH_SIZE  = 32                  # up from 16 — only used 2.3/32 GB before
+PATIENCE    = 50                  # wider window so plateaus don't kill a run
+VAL_SPLIT       = 0.15            # 15% held out for validation
+TARGET_NEG_RATE = 0.35            # cap training negatives at 35% (was 53%)
+SEED            = 42
+WORKERS         = 8
 
 
 def split_dataset():
-    """Write splits/train.txt and splits/val.txt with random image paths.
+    """Write splits/train.txt and splits/val.txt with stratified splits.
 
     Images and labels stay flat in dataset/images/ and dataset/labels/.
-    Each split file contains one relative path per line (relative to dataset/).
+    Training negatives are downsampled to TARGET_NEG_RATE to boost
+    positive density per epoch.  Validation keeps full distribution.
     """
     SPLITS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -52,18 +58,49 @@ def split_dataset():
         print("[split] ERROR: no images found in", IMAGES_DIR)
         sys.exit(1)
 
+    # Classify images as positive (has annotations) or negative (empty label)
+    positives, negatives = [], []
+    for img in images:
+        lbl = LABELS_DIR / img.with_suffix(".txt").name
+        if lbl.exists() and lbl.stat().st_size > 0:
+            positives.append(img)
+        else:
+            negatives.append(img)
+
+    print(f"[split] {len(images)} total: {len(positives)} pos, {len(negatives)} neg"
+          f" ({100 * len(negatives) / len(images):.0f}% neg)")
+
     random.seed(SEED)
-    random.shuffle(images)
-    n_val = max(1, int(len(images) * VAL_SPLIT))
-    val_set = images[:n_val]
-    train_set = images[n_val:]
+    random.shuffle(positives)
+    random.shuffle(negatives)
+
+    # Stratified split — both groups get same val fraction
+    n_val_pos = max(1, int(len(positives) * VAL_SPLIT))
+    n_val_neg = max(1, int(len(negatives) * VAL_SPLIT))
+
+    val_set   = positives[:n_val_pos] + negatives[:n_val_neg]
+    train_pos = positives[n_val_pos:]
+    train_neg = negatives[n_val_neg:]
+
+    # Downsample training negatives to TARGET_NEG_RATE
+    max_neg = int(len(train_pos) * TARGET_NEG_RATE / (1 - TARGET_NEG_RATE))
+    if len(train_neg) > max_neg:
+        print(f"[split] Downsampling train negatives: {len(train_neg)} → {max_neg}"
+              f" (target {TARGET_NEG_RATE * 100:.0f}%)")
+        train_neg = train_neg[:max_neg]
+
+    train_set = train_pos + train_neg
+    random.shuffle(train_set)
+    random.shuffle(val_set)
 
     train_txt = SPLITS_DIR / "train.txt"
     val_txt   = SPLITS_DIR / "val.txt"
-    train_txt.write_text("\n".join(f"images/{p.name}" for p in train_set) + "\n")
-    val_txt.write_text("\n".join(f"images/{p.name}" for p in val_set) + "\n")
+    train_txt.write_text("\n".join(str(p) for p in train_set) + "\n")
+    val_txt.write_text("\n".join(str(p) for p in val_set) + "\n")
 
-    print(f"[split] {len(images)} total → train={len(train_set)}, val={len(val_set)}")
+    neg_pct = 100 * len(train_neg) / len(train_set) if train_set else 0
+    print(f"[split] train={len(train_set)} ({len(train_neg)} neg, {neg_pct:.0f}%),"
+          f" val={len(val_set)}")
     print(f"[split] wrote {train_txt.relative_to(ROOT)} and {val_txt.relative_to(ROOT)}")
 
 
@@ -139,24 +176,35 @@ def train():
             device=0,
             workers=WORKERS,
             seed=SEED,
-            # augmentation
+            # ── loss weights ── defaults (v3 rebalancing regressed mAP@0.5:0.95)
+            box=7.5,
+            dfl=1.5,
+            cls=0.5,
+            # ── learning rate ──
+            lr0=0.015,                # slightly higher w/ cosine annealing
+            warmup_epochs=5.0,        # longer warmup for stability
+            cos_lr=True,              # cosine annealing — smoother decay
+            # ── augmentation (detect-valid only) ──
             hsv_h=0.015,
             hsv_s=0.7,
             hsv_v=0.4,
-            degrees=0.0,
+            degrees=5.0,              # slight rotation invariance
             translate=0.1,
-            scale=0.5,
+            scale=0.7,                # aggressive multi-scale
+            perspective=0.0005,       # slight perspective distortion
             fliplr=0.5,
             flipud=0.0,
             mosaic=1.0,
-            mixup=0.1,
-            # output
+            mixup=0.15,               # label-blending regularization
+            cutmix=0.1,              # partial-region occlusion robustness
+            close_mosaic=15,          # fine-tune w/o mosaic for last 15 ep
+            # ── output ──
             project=str(ROOT / "runs"),
             name="yolo11n_target",
             exist_ok=True,
             plots=True,
             save=True,
-            save_period=25,          # checkpoint every 25 epochs
+            save_period=25,           # checkpoint every 25 epochs
             val=True,
             verbose=True,
         )

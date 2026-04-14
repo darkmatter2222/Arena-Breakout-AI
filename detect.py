@@ -30,7 +30,6 @@ import struct
 import sys
 import threading
 import time
-import winsound
 
 import mss
 import numpy as np
@@ -62,7 +61,7 @@ MODEL_PATH = BASE_DIR / "models" / "best.pt"
 
 CAPTURE_WIDTH = 600
 CAPTURE_HEIGHT = 416
-TARGET_FPS = 30
+TARGET_FPS = 60
 CONF_THRESHOLD = 0.60
 
 VK_NUMPAD2 = 0x62
@@ -80,53 +79,85 @@ HARVEST_MAX  = 0.80   # ceiling when detections are rare (<1/sec)
 HARVEST_WINDOW = 3.0  # seconds of history for rolling detection rate
 JPEG_QUALITY = 95
 
-# ── Synthetic tick sound (in-memory WAV) ──────────────────────────────────────
-def _make_tick_wav(freq=880, duration_ms=18, volume=0.25, sample_rate=22050):
-    """Generate a tiny WAV as bytes — short sine burst with fast fade-out."""
-    n = int(sample_rate * duration_ms / 1000)
-    samples = []
+# ── Streaming tick audio engine ───────────────────────────────────────────────
+#
+# Keeps a persistent PyAudio output stream running at all times.  The callback
+# pulls from a ring buffer; tick() just drops samples in.  Zero per-call
+# overhead — works at any FPS.
+
+import pyaudio
+import array as _array
+
+_AUDIO_RATE   = 22050
+_TICK_FREQ    = 880     # Hz — detection tick
+_SAVE_FREQ    = 1320    # Hz — image-saved ping
+_TICK_DUR_MS  = 18
+_TICK_VOLUME  = 0.25
+
+def _make_tick_samples(freq=_TICK_FREQ, duration_ms=_TICK_DUR_MS,
+                       volume=_TICK_VOLUME, rate=_AUDIO_RATE):
+    """Generate tick as a list of float samples (−1..1)."""
+    n = int(rate * duration_ms / 1000)
+    out = []
     for i in range(n):
-        t = i / sample_rate
-        fade = 1.0 - (i / n)          # linear fade-out
-        val = volume * fade * math.sin(2 * math.pi * freq * t)
-        samples.append(int(max(-32767, min(32767, val * 32767))))
-    # Pack as 16-bit mono PCM WAV
-    data = struct.pack(f"<{n}h", *samples)
-    hdr  = struct.pack("<4sI4s", b"RIFF", 36 + len(data), b"WAVE")
-    fmt  = struct.pack("<4sIHHIIHH", b"fmt ", 16, 1, 1, sample_rate,
-                       sample_rate * 2, 2, 16)
-    dhdr = struct.pack("<4sI", b"data", len(data))
-    return hdr + fmt + dhdr + data
+        t = i / rate
+        fade = 1.0 - (i / n)
+        out.append(volume * fade * math.sin(2 * math.pi * freq * t))
+    return out
 
-_TICK_WAV = _make_tick_wav()           # 880 Hz — detection
-_SAVE_WAV = _make_tick_wav(freq=1320)  # higher pitch — image saved
+_TICK_SAMPLES = _make_tick_samples(_TICK_FREQ)
+_SAVE_SAMPLES = _make_tick_samples(_SAVE_FREQ)
 
 
-# ── Tick player (background thread, non-blocking) ────────────────────────────
+class _AudioStream:
+    """Persistent low-latency audio output via PyAudio callback.
+
+    call tick() or tick(save=True) from any thread — it just appends
+    samples to a lock-protected buffer that the callback drains.
+    """
+    def __init__(self, rate=_AUDIO_RATE, chunk=256):
+        self._rate = rate
+        self._chunk = chunk
+        self._buf: list[float] = []
+        self._lock = threading.Lock()
+        self._pa = pyaudio.PyAudio()
+        self._stream = self._pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=rate,
+            output=True,
+            frames_per_buffer=chunk,
+            stream_callback=self._callback,
+        )
+
+    def tick(self, save=False):
+        """Inject a tick into the audio buffer (replaces any pending tick)."""
+        samples = _SAVE_SAMPLES if save else _TICK_SAMPLES
+        with self._lock:
+            # Replace buffer — latest tick wins, no queue buildup
+            self._buf = list(samples)
+
+    def _callback(self, _in_data, frame_count, _time_info, _status):
+        with self._lock:
+            if self._buf:
+                chunk = self._buf[:frame_count]
+                self._buf = self._buf[frame_count:]
+            else:
+                chunk = []
+        # Pad with silence if needed
+        out = chunk + [0.0] * (frame_count - len(chunk))
+        data = struct.pack(f'<{frame_count}h',
+                           *(int(max(-32767, min(32767, s * 32767))) for s in out))
+        return (data, pyaudio.paContinue)
+
+_audio = _AudioStream()
+
+# Wrapper matching old _tick_player interface used in main loop
 class _TickPlayer:
-    """Plays short WAVs on a daemon thread so the main loop never blocks."""
-    def __init__(self):
-        self._q: queue.Queue = queue.Queue(maxsize=8)
-        self._stop = threading.Event()
-        t = threading.Thread(target=self._run, daemon=True)
-        t.start()
-
     def tick(self, wav=None):
-        try:
-            self._q.put_nowait(wav or _TICK_WAV)
-        except queue.Full:
-            pass
-
-    def _run(self):
-        while not self._stop.is_set():
-            try:
-                wav = self._q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                winsound.PlaySound(wav, winsound.SND_MEMORY)
-            except Exception:
-                pass
+        _audio.tick(save=False)
+    def tick_save(self):
+        _audio.tick(save=True)
 
 _tick_player = _TickPlayer()
 
@@ -208,9 +239,11 @@ def move_mouse_relative(dx: int, dy: int):
 
 
 # ── Smoothing config ──────────────────────────────────────────────────────────
-SMOOTH_ALPHA = 0.5    # EMA blend: 0 = frozen, 1 = raw (no smoothing)
-DEAD_ZONE    = 1      # Ignore sub-pixel jitter below this many pixels
-MOVE_FRAC    = 0.6    # Move this fraction of the offset per frame (prevents overshoot)
+SMOOTH_ALPHA   = 0.92   # EMA blend: 0 = frozen, 1 = raw (high = responsive)
+DEAD_ZONE      = 1      # Ignore sub-pixel jitter below this many pixels
+MOVE_FRAC_MAX  = 0.92   # Fraction when target is very close (snappy)
+MOVE_FRAC_MIN  = 0.65   # Fraction when target is far away (still decisive)
+MOVE_DECAY     = 150.0  # Distance (px) at which frac drops to ~37% of range
 
 
 # ── Transparent Overlay (capture-proof) ───────────────────────────────────────
@@ -474,25 +507,46 @@ class Overlay:
             _gdi32.DeleteObject(pen)
             _gdi32.DeleteObject(brush)
 
-        # Crosshairs (+) on detection centers — color by confidence
+        # Crosshairs (+) with bullseye ring on detection centers
         if dets:
-            arm = 5
-            for cx, cy, conf in dets:
-                # Map confidence from CONF_THRESHOLD..1.0 → red..green
-                t = max(0.0, min(1.0, (conf - CONF_THRESHOLD) / (1.0 - CONF_THRESHOLD)))
-                r = int(255 * (1 - t))
-                g = int(255 * t)
-                color = _rgb(r, g, 0)
-                pen = _gdi32.CreatePen(_PS_SOLID, 1, color)
-                op  = _gdi32.SelectObject(hdc, pen)
+            arm = 12   # crosshair arm length (px from center)
+            gap = 3    # gap around center for readability
+            ring_r = 8 # bullseye ring radius
+            for cx, cy, _conf in dets:
                 wx = int(round(cx)) + pad
                 wy = int(round(cy)) + pad
+                # Black outline pass (2px pen, drawn first)
+                pen_bg = _gdi32.CreatePen(_PS_SOLID, 3, _rgb(0, 0, 0))
+                op = _gdi32.SelectObject(hdc, pen_bg)
+                ob = _gdi32.SelectObject(hdc, null_brush)
                 _gdi32.MoveToEx(hdc, wx - arm, wy, None)
+                _gdi32.LineTo(hdc, wx - gap, wy)
+                _gdi32.MoveToEx(hdc, wx + gap + 1, wy, None)
                 _gdi32.LineTo(hdc, wx + arm + 1, wy)
                 _gdi32.MoveToEx(hdc, wx, wy - arm, None)
+                _gdi32.LineTo(hdc, wx, wy - gap)
+                _gdi32.MoveToEx(hdc, wx, wy + gap + 1, None)
                 _gdi32.LineTo(hdc, wx, wy + arm + 1)
+                _gdi32.Ellipse(hdc, wx - ring_r, wy - ring_r, wx + ring_r + 1, wy + ring_r + 1)
                 _gdi32.SelectObject(hdc, op)
-                _gdi32.DeleteObject(pen)
+                _gdi32.SelectObject(hdc, ob)
+                _gdi32.DeleteObject(pen_bg)
+                # Bright foreground pass (1px pen, drawn on top)
+                pen_fg = _gdi32.CreatePen(_PS_SOLID, 1, _CROSS_COLOR)
+                op = _gdi32.SelectObject(hdc, pen_fg)
+                ob = _gdi32.SelectObject(hdc, null_brush)
+                _gdi32.MoveToEx(hdc, wx - arm, wy, None)
+                _gdi32.LineTo(hdc, wx - gap, wy)
+                _gdi32.MoveToEx(hdc, wx + gap + 1, wy, None)
+                _gdi32.LineTo(hdc, wx + arm + 1, wy)
+                _gdi32.MoveToEx(hdc, wx, wy - arm, None)
+                _gdi32.LineTo(hdc, wx, wy - gap)
+                _gdi32.MoveToEx(hdc, wx, wy + gap + 1, None)
+                _gdi32.LineTo(hdc, wx, wy + arm + 1)
+                _gdi32.Ellipse(hdc, wx - ring_r, wy - ring_r, wx + ring_r + 1, wy + ring_r + 1)
+                _gdi32.SelectObject(hdc, op)
+                _gdi32.SelectObject(hdc, ob)
+                _gdi32.DeleteObject(pen_fg)
 
         user32.EndPaint(hwnd, ctypes.byref(ps))
 
@@ -662,11 +716,13 @@ def main():
                     smooth_x = SMOOTH_ALPHA * raw_cx + (1 - SMOOTH_ALPHA) * smooth_x
                     smooth_y = SMOOTH_ALPHA * raw_cy + (1 - SMOOTH_ALPHA) * smooth_y
 
-                # Move a fraction of the offset — converges without yo-yo
+                # Distance-dependent easing: cautious from far, snappy when close
                 off_x = smooth_x - center_x
                 off_y = smooth_y - center_y
-                dx = int(round(off_x * MOVE_FRAC))
-                dy = int(round(off_y * MOVE_FRAC))
+                dist = math.hypot(off_x, off_y)
+                frac = MOVE_FRAC_MIN + (MOVE_FRAC_MAX - MOVE_FRAC_MIN) * math.exp(-dist / MOVE_DECAY)
+                dx = int(round(off_x * frac))
+                dy = int(round(off_y * frac))
 
                 if abs(dx) > DEAD_ZONE or abs(dy) > DEAD_ZONE:
                     move_mouse_relative(dx, dy)
@@ -711,7 +767,7 @@ def main():
                     if not _write_queue.full():
                         _write_queue.put_nowait((fpath, frame.copy()))
                         if tick_on:
-                            _tick_player.tick(_SAVE_WAV)
+                            _tick_player.tick_save()
 
             # ── Frame pacing ──────────────────────────────────────────────
             elapsed = time.perf_counter() - t0
