@@ -238,12 +238,59 @@ def move_mouse_relative(dx: int, dy: int):
     return result  # 1 = success, 0 = blocked (e.g. UIPI)
 
 
+def _distance_frac(dist: float) -> float:
+    """Return an easing fraction that is gentle near center and stronger far away."""
+    return MOVE_FRAC_FAR - (MOVE_FRAC_FAR - MOVE_FRAC_CLOSE) * math.exp(-dist / MOVE_DECAY)
+
+
+def _step_cap(dist: float) -> float:
+    """Return the max allowed movement magnitude for the current target distance."""
+    return MAX_STEP_CLOSE + (MAX_STEP_FAR - MAX_STEP_CLOSE) * (1.0 - math.exp(-dist / MAX_STEP_DECAY))
+
+
+def _box_size_damp(box_w: float, box_h: float) -> float:
+    """Reduce movement on large on-screen targets, where scoped overshoot shows up most."""
+    box_diag = math.hypot(box_w, box_h)
+    damp = 140.0 / max(140.0, box_diag)
+    return max(BOX_SIZE_DAMP_MIN, min(1.0, damp))
+
+
+def _compute_move(off_x: float, off_y: float, box_w: float, box_h: float, snap: bool) -> tuple[int, int]:
+    """Convert target offset into an assertive but bounded relative mouse step."""
+    dist = math.hypot(off_x, off_y)
+    if dist <= 0.0:
+        return 0, 0
+
+    frac = SNAP_FRAC if snap else _distance_frac(dist)
+    damp = _box_size_damp(box_w, box_h)
+    move_x = off_x * frac * damp
+    move_y = off_y * frac * damp
+
+    cap = _step_cap(dist)
+    move_dist = math.hypot(move_x, move_y)
+    if move_dist > cap:
+        scale = cap / move_dist
+        move_x *= scale
+        move_y *= scale
+
+    return int(round(move_x)), int(round(move_y))
+
+
 # ── Smoothing config ──────────────────────────────────────────────────────────
-SMOOTH_ALPHA   = 0.92   # EMA blend: 0 = frozen, 1 = raw (high = responsive)
-DEAD_ZONE      = 1      # Ignore sub-pixel jitter below this many pixels
-MOVE_FRAC_MAX  = 0.92   # Fraction when target is very close (snappy)
-MOVE_FRAC_MIN  = 0.65   # Fraction when target is far away (still decisive)
-MOVE_DECAY     = 150.0  # Distance (px) at which frac drops to ~37% of range
+SMOOTH_ALPHA    = 0.80   # EMA blend: heavier filtering to kill bbox jitter
+DEAD_ZONE       = 3      # Absorb ±3px noise once on-target
+MOVE_FRAC_CLOSE = 0.35   # Gentle when near center (prevents overshoot)
+MOVE_FRAC_FAR   = 0.90   # Aggressive when far (fast initial convergence)
+MOVE_DECAY      = 60.0   # Distance at which frac transitions
+SNAP_FRAC       = 0.55   # First-frame engagement kept conservative to avoid scoped overshoot
+MAX_STEP_CLOSE  = 20.0   # px cap near center to avoid oscillation
+MAX_STEP_FAR    = 115.0  # px cap when far away to stay assertive without jumping past target
+MAX_STEP_DECAY  = 90.0   # Distance scale for step-cap ramp
+BOX_SIZE_DAMP_MIN = 0.55 # Large on-screen targets get reduced movement
+
+# ── Target locking ────────────────────────────────────────────────────────────
+LOCK_RADIUS       = 120.0  # wider lock for fast combat movement
+LOCK_GRACE_FRAMES = 8      # hold longer through detection flicker
 
 
 # ── Transparent Overlay (capture-proof) ───────────────────────────────────────
@@ -357,23 +404,35 @@ _gdi32.LineTo.argtypes     = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
 _gdi32.CreateSolidBrush.restype  = ctypes.c_void_p
 _gdi32.CreateSolidBrush.argtypes = [ctypes.c_ulong]
 _gdi32.Ellipse.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+_gdi32.SetBkMode.argtypes      = [ctypes.c_void_p, ctypes.c_int]
+_gdi32.SetTextColor.restype     = ctypes.c_ulong
+_gdi32.SetTextColor.argtypes    = [ctypes.c_void_p, ctypes.c_ulong]
+_gdi32.TextOutW.argtypes        = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p, ctypes.c_int]
+_gdi32.CreateFontW.restype      = ctypes.c_void_p
+_gdi32.CreateFontW.argtypes     = [
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+    ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
+    ctypes.c_wchar_p]
 
 
 class Overlay:
-    """Capture-proof overlay: teal glow border + detection crosshairs."""
-    PAD = 3  # px of border outside the capture region
+    """Capture-proof overlay: green border + status labels + detection crosshairs."""
+    PAD = 3       # px of border outside the capture region
+    TEXT_H = 16   # px height for status text above border
 
     def __init__(self, region_left, region_top, capture_w, capture_h):
         self._cap_w = capture_w
         self._cap_h = capture_h
         self._win_w = capture_w  + 2 * self.PAD
-        self._win_h = capture_h + 2 * self.PAD
+        self._win_h = capture_h + 2 * self.PAD + self.TEXT_H
         self._win_x = region_left - self.PAD
-        self._win_y = region_top  - self.PAD
+        self._win_y = region_top  - self.PAD - self.TEXT_H
         self._dets  = []          # [(cx, cy, conf), ...] in capture-pixel coords
         self._armed = False
         self._capture = False
         self._harvest = False
+        self._tick = False
         self._lock  = threading.Lock()
         self._hwnd  = None
         self._ready = threading.Event()
@@ -382,13 +441,14 @@ class Overlay:
         threading.Thread(target=self._run, daemon=True).start()
         self._ready.wait(5)
 
-    def update(self, detections, armed=False, capture_on=False, harvest_on=False):
+    def update(self, detections, armed=False, capture_on=False, harvest_on=False, tick_on=False):
         """Push new detection centers and trigger repaint."""
         with self._lock:
             self._dets = [(d[0], d[1], d[4]) for d in detections]
             self._armed = armed
             self._capture = capture_on
             self._harvest = harvest_on
+            self._tick = tick_on
         if self._hwnd:
             user32.PostMessageW(self._hwnd, _WM_REPAINT, 0, 0)
             self._frame_count += 1
@@ -448,64 +508,46 @@ class Overlay:
             return
 
         w, h, pad = self._win_w, self._win_h, self.PAD
+        yoff = self.TEXT_H
         null_brush = _gdi32.GetStockObject(_NULL_BRUSH)
 
-        # Border color based on armed state
         with self._lock:
             is_armed = self._armed
             is_capture = self._capture
             is_harvest = self._harvest
+            is_tick = self._tick
             dets = list(self._dets)
 
-        if is_armed:
-            colors = [_GREEN_DIM, _GREEN_BRIGHT, _GREEN_DIM]
-        else:
-            colors = [_RED_DIM, _RED_BRIGHT, _RED_DIM]
-
-        # 3 concentric 1-px rectangles
+        # Always-green border (shifted below text strip)
+        colors = [_GREEN_DIM, _GREEN_BRIGHT, _GREEN_DIM]
         for i, color in enumerate(colors):
             pen = _gdi32.CreatePen(_PS_SOLID, 1, color)
             op  = _gdi32.SelectObject(hdc, pen)
             ob  = _gdi32.SelectObject(hdc, null_brush)
-            _gdi32.Rectangle(hdc, i, i, w - i, h - i)
+            _gdi32.Rectangle(hdc, i, yoff + i, w - i, h - i)
             _gdi32.SelectObject(hdc, op)
             _gdi32.SelectObject(hdc, ob)
             _gdi32.DeleteObject(pen)
 
-        # Red dot outside top-right corner when capture is on
-        if is_capture:
-            dot_r = 4
-            dot_cx = w - pad + 2 + dot_r   # just outside top-right
-            dot_cy = pad - 2 - dot_r
-            # Clamp inside window bounds
-            dot_cx = min(dot_cx, w - dot_r - 1)
-            dot_cy = max(dot_r + 1, dot_cy)
-            brush = _gdi32.CreateSolidBrush(_REC_DOT)
-            pen = _gdi32.CreatePen(_PS_SOLID, 1, _REC_DOT)
-            op = _gdi32.SelectObject(hdc, pen)
-            ob = _gdi32.SelectObject(hdc, brush)
-            _gdi32.Ellipse(hdc, dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r)
-            _gdi32.SelectObject(hdc, op)
-            _gdi32.SelectObject(hdc, ob)
-            _gdi32.DeleteObject(pen)
-            _gdi32.DeleteObject(brush)
-
-        # Amber dot on top-left corner when harvest is on
-        if is_harvest:
-            dot_r = 4
-            dot_cx = pad - 2 - dot_r   # just outside top-left
-            dot_cy = pad - 2 - dot_r
-            dot_cx = max(dot_r + 1, dot_cx)
-            dot_cy = max(dot_r + 1, dot_cy)
-            brush = _gdi32.CreateSolidBrush(_HARVEST_DOT)
-            pen = _gdi32.CreatePen(_PS_SOLID, 1, _HARVEST_DOT)
-            op = _gdi32.SelectObject(hdc, pen)
-            ob = _gdi32.SelectObject(hdc, brush)
-            _gdi32.Ellipse(hdc, dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r)
-            _gdi32.SelectObject(hdc, op)
-            _gdi32.SelectObject(hdc, ob)
-            _gdi32.DeleteObject(pen)
-            _gdi32.DeleteObject(brush)
+        # Status labels: "2:TICK  3:HARVEST  5:ARMED  6:CAPTURE"
+        # (drawn on transparent background — window bg is color-key black)
+        _gdi32.SetBkMode(hdc, 1)  # TRANSPARENT
+        font = _gdi32.CreateFontW(
+            13, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 3, 0, "Consolas")
+        old_font = _gdi32.SelectObject(hdc, font)
+        labels = [
+            ("2:TICK", is_tick),
+            ("3:HARVEST", is_harvest),
+            ("5:ARMED", is_armed),
+            ("6:CAPTURE", is_capture),
+        ]
+        tx = pad + 2
+        for text, is_on in labels:
+            _gdi32.SetTextColor(hdc, _GREEN_BRIGHT if is_on else _RED_BRIGHT)
+            _gdi32.TextOutW(hdc, tx, 1, text, len(text))
+            tx += (len(text) + 2) * 7
+        _gdi32.SelectObject(hdc, old_font)
+        _gdi32.DeleteObject(font)
 
         # Crosshairs (+) with bullseye ring on detection centers
         if dets:
@@ -514,7 +556,7 @@ class Overlay:
             ring_r = 8 # bullseye ring radius
             for cx, cy, _conf in dets:
                 wx = int(round(cx)) + pad
-                wy = int(round(cy)) + pad
+                wy = int(round(cy)) + pad + yoff
                 # Black outline pass (2px pen, drawn first)
                 pen_bg = _gdi32.CreatePen(_PS_SOLID, 3, _rgb(0, 0, 0))
                 op = _gdi32.SelectObject(hdc, pen_bg)
@@ -631,6 +673,10 @@ def main():
     smooth_x: float | None = None
     smooth_y: float | None = None
     was_tracking = False
+    # Target locking state
+    lock_cx: float | None = None
+    lock_cy: float | None = None
+    lock_grace: int = 0
 
     # Start background writer
     writer = threading.Thread(target=_writer_thread, daemon=True)
@@ -687,7 +733,8 @@ def main():
                     detections.append((cx, cy, w, h, conf))
 
             # ── Update overlay ────────────────────────────────────────────
-            overlay.update(detections, armed=armed, capture_on=capture_on, harvest_on=harvest_on)
+            overlay.update(detections, armed=armed, capture_on=capture_on,
+                           harvest_on=harvest_on, tick_on=tick_on)
 
             # ── Console log ───────────────────────────────────────────────
             if detections:
@@ -701,31 +748,58 @@ def main():
                 print(f"{tag} {len(detections)} det: {', '.join(parts)}")
 
             # ── Move mouse when armed + RMB held ─────────────────────────
-            if armed and detections and (GetAsyncKeyState(VK_RBUTTON) & 0x8000):
-                # Lock onto the highest-confidence detection
+            if armed and (GetAsyncKeyState(VK_RBUTTON) & 0x8000):
                 center_x = CAPTURE_WIDTH / 2
                 center_y = CAPTURE_HEIGHT / 2
-                best = max(detections, key=lambda d: d[4])
-                raw_cx, raw_cy = best[0], best[1]
+                target = None
 
-                # EMA smooth: filter out per-frame detection jitter
-                if not was_tracking or smooth_x is None:
-                    smooth_x = raw_cx
-                    smooth_y = raw_cy
+                if detections:
+                    if lock_cx is not None:
+                        # Find detection closest to locked position
+                        closest = min(detections, key=lambda d: math.hypot(d[0] - lock_cx, d[1] - lock_cy))
+                        if math.hypot(closest[0] - lock_cx, closest[1] - lock_cy) < LOCK_RADIUS:
+                            target = closest
+                            lock_grace = 0
+                        else:
+                            # Locked target moved too far — grace period
+                            lock_grace += 1
+                            if lock_grace > LOCK_GRACE_FRAMES:
+                                target = max(detections, key=lambda d: d[4])
+                                lock_grace = 0
+                    if target is None and lock_grace == 0:
+                        # No lock yet or grace expired — acquire best
+                        target = max(detections, key=lambda d: d[4])
                 else:
-                    smooth_x = SMOOTH_ALPHA * raw_cx + (1 - SMOOTH_ALPHA) * smooth_x
-                    smooth_y = SMOOTH_ALPHA * raw_cy + (1 - SMOOTH_ALPHA) * smooth_y
+                    # No detections this frame — hold lock during grace
+                    if lock_cx is not None:
+                        lock_grace += 1
+                        if lock_grace > LOCK_GRACE_FRAMES:
+                            lock_cx = None
+                            lock_cy = None
+                            lock_grace = 0
 
-                # Distance-dependent easing: cautious from far, snappy when close
-                off_x = smooth_x - center_x
-                off_y = smooth_y - center_y
-                dist = math.hypot(off_x, off_y)
-                frac = MOVE_FRAC_MIN + (MOVE_FRAC_MAX - MOVE_FRAC_MIN) * math.exp(-dist / MOVE_DECAY)
-                dx = int(round(off_x * frac))
-                dy = int(round(off_y * frac))
+                if target is not None:
+                    raw_cx, raw_cy, raw_w, raw_h = target[0], target[1], target[2], target[3]
+                    lock_cx = raw_cx
+                    lock_cy = raw_cy
 
-                if abs(dx) > DEAD_ZONE or abs(dy) > DEAD_ZONE:
-                    move_mouse_relative(dx, dy)
+                    if not was_tracking or smooth_x is None:
+                        # SNAP: bounded first frame to avoid long-range scoped overshoot
+                        smooth_x = raw_cx
+                        smooth_y = raw_cy
+                        off_x = raw_cx - center_x
+                        off_y = raw_cy - center_y
+                        dx, dy = _compute_move(off_x, off_y, raw_w, raw_h, snap=True)
+                    else:
+                        # TRACK: EMA smoothed + bounded easing
+                        smooth_x = SMOOTH_ALPHA * raw_cx + (1 - SMOOTH_ALPHA) * smooth_x
+                        smooth_y = SMOOTH_ALPHA * raw_cy + (1 - SMOOTH_ALPHA) * smooth_y
+                        off_x = smooth_x - center_x
+                        off_y = smooth_y - center_y
+                        dx, dy = _compute_move(off_x, off_y, raw_w, raw_h, snap=False)
+
+                    if abs(dx) > DEAD_ZONE or abs(dy) > DEAD_ZONE:
+                        move_mouse_relative(dx, dy)
 
                 was_tracking = True
             else:
@@ -733,6 +807,9 @@ def main():
                 was_tracking = False
                 smooth_x = None
                 smooth_y = None
+                lock_cx = None
+                lock_cy = None
+                lock_grace = 0
 
             # ── Capture frame while RMB held ──────────────────────────────
             if capture_on and (GetAsyncKeyState(VK_RBUTTON) & 0x8000):

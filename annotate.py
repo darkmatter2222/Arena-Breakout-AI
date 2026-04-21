@@ -32,10 +32,19 @@ import os
 import sys
 import json
 import shutil
+import base64
+import io
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 from pathlib import Path
+
+try:
+    import requests as _requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
 
 try:
     from ultralytics import YOLO as _YOLO
@@ -51,6 +60,7 @@ IMAGES_DIR = DATASET_DIR / "images"
 LABELS_DIR = DATASET_DIR / "labels"
 PROGRESS_FILE = DATASET_DIR / ".annotation_progress.json"
 INFERENCE_CACHE_FILE = DATASET_DIR / ".inference_cache.json"
+PRE_ANNOTATION_FILE = DATASET_DIR / ".pre_annotation.json"
 
 CLASS_ID = 0
 CLASS_NAME = "target"  # Change this to your actual class name
@@ -68,6 +78,41 @@ PREDICTION_CONF_THRESH = 0.25   # minimum confidence to show prediction box
 MODEL_WEIGHTS = BASE_DIR / "models" / "best.pt"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+# LLM Vision QA settings
+LLM_BASE_URL = "http://192.168.86.48:8001"
+LLM_MODEL = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"
+LLM_QA_PROMPT = (
+    "You are an annotation quality assessor for a video game object detection dataset. "
+    "The green bounding boxes drawn on this image are annotations that should tightly "
+    "enclose the HEAD of a character (person) in a video game.\n\n"
+    "Rate the annotation quality on a scale of 1 to 10:\n"
+    "  10 = Box is perfectly placed, tightly fitting the character's head\n"
+    "  7-9 = Box is on the head but slightly too large, small, or offset\n"
+    "  4-6 = Box partially covers the head but is noticeably misaligned or wrong size\n"
+    "  1-3 = Box is not on a character's head at all, or completely wrong\n"
+    "  1 = No head visible or box is on a totally irrelevant area\n\n"
+    "If there are no green boxes in the image, respond with score 0.\n\n"
+    "Respond with ONLY a JSON object in this exact format, nothing else:\n"
+    '{\"score\": <number>, \"reason\": \"<one sentence explanation>\"}'
+)
+LLM_HEAD_DETECT_PROMPT = (
+    "You are analyzing a screenshot from a first-person shooter video game. "
+    "Your job is to determine whether any enemy player's HEAD is visible in this image.\n\n"
+    "Look carefully for context clues:\n"
+    "- Player character bodies, shoulders, arms holding weapons\n"
+    "- Helmets, hair, or any head-shaped silhouette on top of a body\n"
+    "- Partially visible heads peeking around corners or cover\n"
+    "- Small or distant heads that might be easy to miss\n\n"
+    "Rate the likelihood that a player's head is visible on a scale of 0 to 10:\n"
+    "  10 = A head is clearly and obviously visible\n"
+    "  7-9 = Very likely a head is present (body visible, head area identifiable)\n"
+    "  4-6 = Possibly a head — something that could be a player but uncertain\n"
+    "  1-3 = Unlikely — maybe distant shapes or ambiguous objects\n"
+    "  0 = No players or heads visible at all (empty scene, sky, terrain only)\n\n"
+    "Respond with ONLY a JSON object in this exact format, nothing else:\n"
+    '{\"score\": <number>, \"reason\": \"<one sentence explanation>\"}'
+)
 
 
 # ── Progress tracker ──────────────────────────────────────────────────────────
@@ -151,6 +196,47 @@ class InferenceCache:
         self.predictions[filename] = preds
 
 
+# ── Pre-Annotation Cache ─────────────────────────────────────────────────────
+class PreAnnotationCache:
+    """Stores LLM pre-annotation scores per image.
+
+    Each entry: {mode: "qa"|"detect", score: 0-10, reason: str, has_detections: bool}
+    """
+
+    def __init__(self, cache_file: Path):
+        self.path = cache_file
+        self.entries: dict[str, dict] = {}
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            with open(self.path, "r") as f:
+                self.entries = json.load(f)
+
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path, "w") as f:
+            json.dump(self.entries, f, indent=1)
+
+    def get(self, filename: str) -> dict | None:
+        return self.entries.get(filename)
+
+    def has(self, filename: str) -> bool:
+        return filename in self.entries
+
+    def put(self, filename: str, mode: str, score: int, reason: str, has_detections: bool):
+        self.entries[filename] = {
+            "mode": mode,
+            "score": score,
+            "reason": reason,
+            "has_detections": has_detections,
+        }
+
+    @property
+    def count(self) -> int:
+        return len(self.entries)
+
+
 # ── Annotation Tool GUI ──────────────────────────────────────────────────────
 class AnnotationTool:
     def __init__(self):
@@ -184,6 +270,13 @@ class AnnotationTool:
         self._mouse_y = 0
         self.predictions: list[tuple[float, float, float, float, float]] = []  # (x1,y1,x2,y2,conf)
         self._advance_timer = None  # pending auto-advance after id
+        self._llm_qa_score: int | None = None  # latest LLM QA score (1-10)
+        self._llm_qa_reason: str = ""           # latest LLM QA reason
+        self._llm_qa_mode: str = "qa"           # "qa" or "detect"
+        self._filtered_files: list[str] = []    # current filtered view (subset of image_files)
+        self._active_filter: str = "All images" # active filter key
+        self._active_filter_display: str = "All images"  # display label with count
+        self._display_to_key: dict[str, str] = {}  # display label -> filter key
 
         # Load YOLO model for prediction overlay
         self.model = None
@@ -198,9 +291,15 @@ class AnnotationTool:
                 print(f"Model not found at {MODEL_WEIGHTS} – prediction overlay disabled")
 
         # Initialize inference cache (persists predictions to disk)
+        # Load cache even without model — cached predictions still display as teal boxes
         self.inference_cache = None
         if self.model is not None:
             self.inference_cache = InferenceCache(INFERENCE_CACHE_FILE, MODEL_WEIGHTS)
+        elif INFERENCE_CACHE_FILE.exists():
+            self.inference_cache = InferenceCache(INFERENCE_CACHE_FILE, MODEL_WEIGHTS)
+
+        # Initialize pre-annotation cache (LLM scores)
+        self.pre_annotation = PreAnnotationCache(PRE_ANNOTATION_FILE)
 
         self._build_gui()
 
@@ -208,7 +307,11 @@ class AnnotationTool:
         if self.model is not None:
             self._run_pre_inference()
 
-        self._load_image()
+        # Show startup stats and offer pre-annotation
+        self._show_startup_dialog()
+
+        # Apply initial filter (show all)
+        self._apply_image_filter()
 
     def _run_pre_inference(self):
         """Run model inference on unannotated images not yet in cache, with a progress bar."""
@@ -272,6 +375,140 @@ class AnnotationTool:
         progress_win.destroy()
         print(f"Pre-inference complete — {total} images processed.")
 
+    def _show_startup_dialog(self):
+        """Show dataset stats and offer to run LLM pre-annotation on un-scored images."""
+        if not _HAS_REQUESTS:
+            return
+
+        total = len(self.image_files)
+        annotated = sum(1 for f in self.image_files if self.progress.is_annotated(f))
+        unannotated = total - annotated
+        pre_annotated = sum(
+            1 for f in self.image_files
+            if not self.progress.is_annotated(f) and self.pre_annotation.has(f)
+        )
+        needs_pre = unannotated - pre_annotated
+
+        print(f"\n  Total images   : {total}")
+        print(f"  Annotated      : {annotated}")
+        print(f"  Unannotated    : {unannotated}")
+        print(f"  Pre-annotated  : {pre_annotated}")
+        print(f"  Needs pre-ann  : {needs_pre}\n")
+
+        if needs_pre <= 0:
+            print("All unannotated images already have LLM pre-annotation scores.")
+            return
+
+        # Ask user
+        answer = messagebox.askyesno(
+            "Pre-Annotation",
+            f"Dataset summary:\n"
+            f"  {total} total images\n"
+            f"  {annotated} annotated\n"
+            f"  {unannotated} unannotated\n"
+            f"  {pre_annotated} already pre-annotated\n"
+            f"  {needs_pre} need LLM pre-annotation\n\n"
+            f"Run LLM pre-annotation on {needs_pre} images now?\n"
+            f"(This sends each image to the vision LLM for scoring)",
+            parent=self.root,
+        )
+
+        if answer:
+            self._run_pre_annotation()
+
+    def _run_pre_annotation(self):
+        """Run LLM pre-annotation on all unannotated images not yet scored."""
+        to_process = [
+            f for f in self.image_files
+            if not self.progress.is_annotated(f) and not self.pre_annotation.has(f)
+        ]
+        if not to_process:
+            return
+
+        total = len(to_process)
+        print(f"Pre-annotating {total} images via LLM...")
+
+        # Progress dialog
+        progress_win = tk.Toplevel(self.root)
+        progress_win.title("LLM Pre-Annotation")
+        progress_win.configure(bg="#2b2b2b")
+        progress_win.geometry("600x160")
+        progress_win.resizable(False, False)
+        progress_win.transient(self.root)
+        progress_win.grab_set()
+
+        tk.Label(
+            progress_win, text="Scoring images with vision LLM...",
+            font=("Consolas", 11), bg="#2b2b2b", fg="#ffffff",
+        ).pack(pady=(15, 5))
+
+        progress_var = tk.DoubleVar(value=0)
+        progress_bar = ttk.Progressbar(
+            progress_win, variable=progress_var, maximum=total, length=540,
+        )
+        progress_bar.pack(pady=5)
+
+        status_label = tk.Label(
+            progress_win, text=f"0 / {total}",
+            font=("Consolas", 10), bg="#2b2b2b", fg="#aaaaaa",
+        )
+        status_label.pack()
+
+        detail_label = tk.Label(
+            progress_win, text="",
+            font=("Consolas", 9), bg="#2b2b2b", fg="#666666",
+        )
+        detail_label.pack()
+
+        errors = 0
+        for idx, fname in enumerate(to_process):
+            filepath = CAPTURES_DIR / fname
+
+            # Determine mode: does the YOLO model have detections for this image?
+            has_dets = False
+            if self.inference_cache is not None:
+                cached = self.inference_cache.get(fname)
+                if cached and len(cached) > 0:
+                    has_dets = True
+
+            # Build the image to send
+            pil_img = Image.open(filepath).convert("RGB")
+            if has_dets:
+                # Draw prediction boxes on the image like the annotation tool does
+                draw = ImageDraw.Draw(pil_img)
+                for x1, y1, x2, y2, conf in cached:
+                    draw.rectangle([x1, y1, x2, y2], outline=(0, 204, 204), width=2)
+                    draw.text((x1 + 2, y1 - 12), f"{conf:.0%}", fill=(0, 204, 204))
+                prompt = LLM_QA_PROMPT
+                mode = "qa"
+            else:
+                prompt = LLM_HEAD_DETECT_PROMPT
+                mode = "detect"
+
+            # Call LLM (reuse existing method)
+            score, reason = self._call_llm_qa(pil_img, prompt)
+
+            if score is not None:
+                self.pre_annotation.put(fname, mode, score, reason, has_dets)
+            else:
+                errors += 1
+                # Store error as score -1 so we can retry later
+                self.pre_annotation.put(fname, mode, -1, reason, has_dets)
+
+            progress_var.set(idx + 1)
+            score_str = f"{score}/10" if score is not None else "err"
+            status_label.config(text=f"{idx + 1} / {total}  ({errors} errors)")
+            detail_label.config(text=f"{fname}  →  {mode} {score_str}")
+            progress_win.update()
+
+            # Periodic save every 25 images
+            if (idx + 1) % 25 == 0:
+                self.pre_annotation.save()
+
+        self.pre_annotation.save()
+        progress_win.destroy()
+        print(f"Pre-annotation complete — {total} images scored, {errors} errors.")
+
     def _build_gui(self):
         self.root = tk.Tk()
         self.root.title("YOLO Annotation Tool")
@@ -285,6 +522,47 @@ class AnnotationTool:
             top_frame, text="", font=("Consolas", 11), bg="#1e1e1e", fg="#ffffff"
         )
         self.file_label.pack(side=tk.LEFT)
+
+        # Pre-annotation filter dropdown
+        # Filter keys (stable identifiers used by _apply_image_filter)
+        self._filter_keys = [
+            "All images",
+            "Unannotated only",
+            "── Head Detection ──",
+            "Heads 9-10 (obvious)",
+            "Heads 7-8 (likely)",
+            "Heads 4-6 (maybe)",
+            "Heads 1-3 (unlikely)",
+            "Heads 0 (empty)",
+            "── Box Quality (single) ──",
+            "QA 1-box 9-10 (perfect)",
+            "QA 1-box 7-8 (good)",
+            "QA 1-box 4-6 (misaligned)",
+            "QA 1-box 1-3 (bad)",
+            "── Box Quality (multi) ──",
+            "QA multi 9-10 (perfect)",
+            "QA multi 7-8 (good)",
+            "QA multi 4-6 (misaligned)",
+            "QA multi 1-3 (bad)",
+            "── Special ──",
+            "Not pre-annotated",
+            "Errors only",
+        ]
+        tk.Label(top_frame, text="Filter:", font=("Consolas", 10),
+                 bg="#1e1e1e", fg="#aaaaaa").pack(side=tk.LEFT, padx=(15, 3))
+        self.filter_var = tk.StringVar(value="All images")
+        self.filter_combo = ttk.Combobox(
+            top_frame, textvariable=self.filter_var, state="readonly",
+            values=self._filter_keys, width=30, font=("Consolas", 10),
+            height=25,
+        )
+        self.filter_combo.pack(side=tk.LEFT, padx=(0, 5))
+        self.filter_combo.bind("<<ComboboxSelected>>", lambda e: self._on_filter_change())
+
+        self.filter_count_label = tk.Label(
+            top_frame, text="", font=("Consolas", 10, "bold"), bg="#1e1e1e", fg="#00cccc"
+        )
+        self.filter_count_label.pack(side=tk.LEFT, padx=(0, 10))
 
         self.status_label = tk.Label(
             top_frame, text="", font=("Consolas", 10), bg="#1e1e1e", fg="#aaaaaa"
@@ -331,6 +609,24 @@ class AnnotationTool:
         )
         self.auto_advance_cb.pack(side=tk.LEFT, padx=(20, 2))
 
+        # LLM QA toggle
+        self.llm_qa_enabled = tk.BooleanVar(value=False)
+        self.llm_qa_cb = tk.Checkbutton(
+            bottom_frame, text="LLM QA", variable=self.llm_qa_enabled,
+            font=("Consolas", 10), bg="#1e1e1e", fg="#ffffff",
+            selectcolor="#3c3c3c", activebackground="#1e1e1e", activeforeground="#ffffff",
+            command=self._on_llm_qa_toggle,
+        )
+        self.llm_qa_cb.pack(side=tk.LEFT, padx=(10, 2))
+        if not _HAS_REQUESTS:
+            self.llm_qa_cb.config(state=tk.DISABLED)
+
+        # LLM QA score display
+        self.llm_score_label = tk.Label(
+            bottom_frame, text="", font=("Consolas", 10, "bold"), bg="#1e1e1e", fg="#ff69b4"
+        )
+        self.llm_score_label.pack(side=tk.LEFT, padx=(5, 0))
+
         self.counter_label = tk.Label(
             bottom_frame, text="", font=("Consolas", 10), bg="#1e1e1e", fg="#aaaaaa"
         )
@@ -365,16 +661,298 @@ class AnnotationTool:
         self.root.bind("<KeyPress-b>", lambda e: self._open_bulk())
         self.root.bind("<KeyPress-B>", lambda e: self._open_bulk())
         self.root.bind("<Escape>", lambda e: self.root.quit())
+        # Ctrl hold = multi-box mode (suppress auto-advance)
+        self._multi_box_mode = False
+        self.root.bind("<KeyPress-Control_L>", lambda e: setattr(self, '_multi_box_mode', True))
+        self.root.bind("<KeyRelease-Control_L>", lambda e: setattr(self, '_multi_box_mode', False))
+        self.root.bind("<KeyPress-Control_R>", lambda e: setattr(self, '_multi_box_mode', True))
+        self.root.bind("<KeyRelease-Control_R>", lambda e: setattr(self, '_multi_box_mode', False))
 
         # Keep keyboard focus on root so key bindings always fire
         self.root.focus_set()
         self.canvas.bind("<Motion>", self._on_mouse_move)
         self.canvas.bind("<ButtonPress-1>", self._on_mouse_down_refocus)
 
+    # ── Image filter ─────────────────────────────────────────────────────
+
+    def _on_filter_change(self):
+        """Handle filter dropdown selection."""
+        selected = self.filter_var.get()
+        # Map display label (with count) back to the filter key
+        key = self._display_to_key.get(selected, selected)
+        # Ignore separator lines
+        if key.startswith("──"):
+            self.filter_var.set(self._active_filter_display)
+            return
+        self._active_filter = key
+        self._apply_image_filter()
+        # Jump to first image in the filtered set
+        if self._filtered_files:
+            self.current_index = 0
+            self._load_image()
+
+    def _match_filter(self, filt: str, fname: str) -> bool:
+        """Return True if fname matches the given filter key."""
+        is_ann = self.progress.is_annotated(fname)
+        pre = self.pre_annotation.get(fname)
+
+        if filt == "All images":
+            return True
+        elif filt == "Unannotated only":
+            return not is_ann
+        elif filt == "Not pre-annotated":
+            return not is_ann and not self.pre_annotation.has(fname)
+        elif filt == "Errors only":
+            return bool(pre and pre.get("score", 0) == -1)
+        elif filt.startswith("Heads"):
+            if is_ann or not pre or pre.get("mode") != "detect":
+                return False
+            score = pre.get("score", -1)
+            if filt == "Heads 9-10 (obvious)":
+                return 9 <= score <= 10
+            elif filt == "Heads 7-8 (likely)":
+                return 7 <= score <= 8
+            elif filt == "Heads 4-6 (maybe)":
+                return 4 <= score <= 6
+            elif filt == "Heads 1-3 (unlikely)":
+                return 1 <= score <= 3
+            elif filt == "Heads 0 (empty)":
+                return score == 0
+        elif filt.startswith("QA"):
+            if is_ann or not pre or pre.get("mode") != "qa":
+                return False
+            score = pre.get("score", -1)
+            # Determine box count from inference cache
+            cached = self.inference_cache.get(fname) if self.inference_cache else None
+            nboxes = len(cached) if cached else 0
+            is_single = (nboxes == 1)
+            is_multi = (nboxes > 1)
+            # Check single-box QA filters
+            if filt == "QA 1-box 9-10 (perfect)":
+                return is_single and 9 <= score <= 10
+            elif filt == "QA 1-box 7-8 (good)":
+                return is_single and 7 <= score <= 8
+            elif filt == "QA 1-box 4-6 (misaligned)":
+                return is_single and 4 <= score <= 6
+            elif filt == "QA 1-box 1-3 (bad)":
+                return is_single and 1 <= score <= 3
+            # Check multi-box QA filters
+            elif filt == "QA multi 9-10 (perfect)":
+                return is_multi and 9 <= score <= 10
+            elif filt == "QA multi 7-8 (good)":
+                return is_multi and 7 <= score <= 8
+            elif filt == "QA multi 4-6 (misaligned)":
+                return is_multi and 4 <= score <= 6
+            elif filt == "QA multi 1-3 (bad)":
+                return is_multi and 1 <= score <= 3
+        return False
+
+    def _apply_image_filter(self):
+        """Build self._filtered_files based on the active filter and refresh dropdown counts."""
+        filt = self._active_filter
+
+        # Single pass: compute counts for all filter keys simultaneously
+        non_sep_keys = [k for k in self._filter_keys if not k.startswith("──")]
+        counts = {k: 0 for k in non_sep_keys}
+        result = []
+
+        for fname in self.image_files:
+            for key in non_sep_keys:
+                if self._match_filter(key, fname):
+                    counts[key] += 1
+            if self._match_filter(filt, fname):
+                result.append(fname)
+
+        self._filtered_files = result
+        count = len(result)
+        self.filter_count_label.config(text=f"({count})")
+
+        # Rebuild dropdown labels with counts
+        self._display_to_key = {}
+        display_labels = []
+        for key in self._filter_keys:
+            if key.startswith("──"):
+                display_labels.append(key)
+                self._display_to_key[key] = key
+            else:
+                n = counts[key]
+                label = f"{key}  ({n})"
+                display_labels.append(label)
+                self._display_to_key[label] = key
+
+        self.filter_combo["values"] = display_labels
+        # Update the displayed text to match the active filter with count
+        for lbl, k in self._display_to_key.items():
+            if k == filt:
+                self._active_filter_display = lbl
+                self.filter_var.set(lbl)
+                break
+
+    # ── LLM QA scoring ────────────────────────────────────────────────────
+
+    def _on_llm_qa_toggle(self):
+        """Called when the LLM QA checkbox is toggled."""
+        if self.llm_qa_enabled.get():
+            self._run_llm_qa()
+        else:
+            self._llm_qa_score = None
+            self._llm_qa_reason = ""
+            self.llm_score_label.config(text="")
+            self._redraw()
+
+    def _render_image_with_boxes(self) -> Image.Image:
+        """Return a PIL image of the current capture with all visible boxes drawn on it.
+
+        Draws both manual annotation boxes (green) and AI prediction boxes (teal)
+        so the VLM sees exactly what's on screen.
+        """
+        filename = self._filtered_files[self.current_index]
+        filepath = self._resolve_image_path(filename)
+        pil_img = Image.open(filepath).convert("RGB")
+        draw = ImageDraw.Draw(pil_img)
+
+        # Draw AI prediction boxes (teal, same as canvas overlay)
+        for x1, y1, x2, y2, conf in self.predictions:
+            draw.rectangle([x1, y1, x2, y2], outline=(0, 204, 204), width=2)
+            draw.text((x1 + 2, y1 - 12), f"{conf:.0%}", fill=(0, 204, 204))
+
+        # Draw manual annotation boxes (green)
+        for box in self.boxes:
+            x1, y1, x2, y2 = box
+            draw.rectangle([x1, y1, x2, y2], outline=(0, 255, 0), width=3)
+            draw.text((x1 + 2, y1 - 12), CLASS_NAME, fill=(0, 255, 0))
+
+        return pil_img
+
+    def _run_llm_qa(self):
+        """Send the current annotated image to the VLM for quality scoring (async)."""
+        if not _HAS_REQUESTS:
+            return
+
+        has_boxes = bool(self.boxes or self.predictions)
+
+        # Choose prompt and image based on whether boxes are present
+        if has_boxes:
+            prompt = LLM_QA_PROMPT
+            img = self._render_image_with_boxes()
+            self._llm_qa_mode = "qa"  # annotation quality mode
+        else:
+            prompt = LLM_HEAD_DETECT_PROMPT
+            # Send the raw image — no boxes to draw
+            filename = self._filtered_files[self.current_index]
+            filepath = self._resolve_image_path(filename)
+            img = Image.open(filepath).convert("RGB")
+            self._llm_qa_mode = "detect"  # head detection mode
+
+        # Show loading state
+        self.llm_score_label.config(text="QA: ...", fg="#aaaaaa")
+        self._llm_qa_score = None
+        self._llm_qa_reason = ""
+
+        current_idx = self.current_index
+
+        def _query():
+            try:
+                score, reason = self._call_llm_qa(img, prompt)
+            except Exception as e:
+                score, reason = None, f"Thread error: {e}"
+            self.root.after(0, lambda: self._on_llm_qa_result(current_idx, score, reason))
+
+        threading.Thread(target=_query, daemon=True).start()
+
+    def _call_llm_qa(self, img: Image.Image, prompt: str) -> tuple[int | None, str]:
+        """Send the image to the VLM and parse the score. Runs in a background thread."""
+        try:
+            # Encode image to base64 JPEG
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+            payload = {
+                "model": LLM_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{img_b64}"
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt,
+                            },
+                        ],
+                    }
+                ],
+                "temperature": 0.3,
+                "max_tokens": 256,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
+            resp = _requests.post(
+                f"{LLM_BASE_URL}/v1/chat/completions",
+                json=payload,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            content = data["choices"][0]["message"]["content"].strip()
+
+            # Parse JSON from response (handle markdown code fences)
+            if content.startswith("```"):
+                # Strip ```json ... ```
+                lines = content.split("\n")
+                content = "\n".join(
+                    l for l in lines if not l.strip().startswith("```")
+                )
+
+            result = json.loads(content)
+            score = int(result.get("score", 0))
+            score = max(0, min(10, score))
+            reason = str(result.get("reason", ""))
+            return score, reason
+
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            return None, f"Parse error: {e}"
+        except _requests.RequestException as e:
+            return None, f"Request error: {e}"
+
+    def _on_llm_qa_result(self, for_index: int, score: int | None, reason: str):
+        """Handle the LLM QA result on the main thread."""
+        # Ignore stale results if user navigated away
+        if self.current_index != for_index or not self.llm_qa_enabled.get():
+            return
+
+        self._llm_qa_score = score
+        self._llm_qa_reason = reason
+
+        if score is not None:
+            # Color-code the score
+            if score >= 8:
+                color = "#00ff00"  # green — great
+            elif score >= 5:
+                color = "#ffaa00"  # orange — okay
+            else:
+                color = "#ff4444"  # red — bad
+
+            mode = getattr(self, '_llm_qa_mode', 'qa')
+            if mode == "detect":
+                label = f"Head?: {score}/10"
+            else:
+                label = f"QA: {score}/10"
+            self.llm_score_label.config(text=label, fg=color)
+        else:
+            self.llm_score_label.config(text=f"QA: err", fg="#ff4444")
+
+        self._redraw()
+
     def _load_image(self):
         """Load the current image and any existing annotations."""
-        filename = self.image_files[self.current_index]
-        filepath = CAPTURES_DIR / filename
+        filename = self._filtered_files[self.current_index]
+        filepath = self._resolve_image_path(filename)
 
         # Load image with PIL
         pil_img = Image.open(filepath)
@@ -416,6 +994,13 @@ class AnnotationTool:
         # Update display
         self._redraw()
         self._update_labels()
+
+        # Trigger LLM QA if enabled
+        self._llm_qa_score = None
+        self._llm_qa_reason = ""
+        self.llm_score_label.config(text="")
+        if self.llm_qa_enabled.get():
+            self._run_llm_qa()
 
     def _load_yolo_labels(self, label_path: Path):
         """Load YOLO format labels back into pixel coordinates."""
@@ -468,9 +1053,68 @@ class AnnotationTool:
 
         self.box_count_label.config(text=f"Boxes: {len(self.boxes)}")
 
+        # Draw cached pre-annotation score (top-left, always visible)
+        filename = self._filtered_files[self.current_index]
+        pre = self.pre_annotation.get(filename)
+        if pre and pre.get("score", -1) >= 0:
+            ps = pre["score"]
+            pm = pre.get("mode", "?")
+            if ps >= 8:
+                pc = "#00ff00"
+            elif ps >= 5:
+                pc = "#ffaa00"
+            else:
+                pc = "#ff4444"
+            plabel = "Head" if pm == "detect" else "QA"
+            self.canvas.create_text(
+                10, 10, anchor=tk.NW,
+                text=f"Pre: {plabel} {ps}/10",
+                font=("Consolas", 12, "bold"), fill=pc,
+                tags="pre_score"
+            )
+            if pre.get("reason"):
+                self.canvas.create_text(
+                    10, 30, anchor=tk.NW,
+                    text=pre["reason"][:80],
+                    font=("Consolas", 9), fill="#999999",
+                    tags="pre_reason"
+                )
+
+        # Draw LLM QA score overlay on canvas (top-right corner)
+        if self._llm_qa_score is not None and self.llm_qa_enabled.get():
+            score = self._llm_qa_score
+            if score >= 8:
+                score_color = "#00ff00"
+            elif score >= 5:
+                score_color = "#ffaa00"
+            else:
+                score_color = "#ff4444"
+
+            display_w = int(self.img_w * self.scale)
+            # Score badge
+            mode = getattr(self, '_llm_qa_mode', 'qa')
+            if mode == "detect":
+                score_text = f"Head?: {score}/10"
+            else:
+                score_text = f"QA: {score}/10"
+            self.canvas.create_text(
+                display_w - 10, 10, anchor=tk.NE,
+                text=score_text,
+                font=("Consolas", 16, "bold"), fill=score_color,
+                tags="llm_qa_score"
+            )
+            # Reason text below the score
+            if self._llm_qa_reason:
+                self.canvas.create_text(
+                    display_w - 10, 34, anchor=tk.NE,
+                    text=self._llm_qa_reason[:80],
+                    font=("Consolas", 9), fill="#cccccc",
+                    tags="llm_qa_reason"
+                )
+
     def _update_labels(self):
         """Update the info labels."""
-        filename = self.image_files[self.current_index]
+        filename = self._filtered_files[self.current_index]
         is_ann = self.progress.is_annotated(filename)
 
         self.file_label.config(text=f"{filename}  ({self.img_w}x{self.img_h})")
@@ -483,7 +1127,14 @@ class AnnotationTool:
         total = len(self.image_files)
         done = self.progress.annotated_count
         self.status_label.config(text=f"{done}/{total} annotated")
-        self.counter_label.config(text=f"Image {self.current_index + 1} / {total}")
+
+        filtered_total = len(self._filtered_files)
+        if self._active_filter == "All images":
+            self.counter_label.config(text=f"Image {self.current_index + 1} / {filtered_total}")
+        else:
+            self.counter_label.config(
+                text=f"Image {self.current_index + 1} / {filtered_total}  [{self._active_filter}]"
+            )
 
     # ── Mouse handlers ────────────────────────────────────────────────────────
 
@@ -545,8 +1196,8 @@ class AnnotationTool:
         self._auto_save()
         self._redraw()
 
-        # Auto-advance to next image after drawing a box
-        if self.auto_advance.get():
+        # Hold Ctrl while drawing to suppress auto-advance (multi-box mode)
+        if self.auto_advance.get() and not self._multi_box_mode:
             self._schedule_advance()
 
     def _on_right_click(self, event):
@@ -568,15 +1219,27 @@ class AnnotationTool:
 
     # ── Actions ───────────────────────────────────────────────────────────────
 
+    def _resolve_image_path(self, filename: str) -> Path:
+        """Return the path to an image, checking captures first then dataset."""
+        cap = CAPTURES_DIR / filename
+        if cap.exists():
+            return cap
+        return IMAGES_DIR / filename
+
     def _auto_save(self):
         """Immediately save current annotations to disk. Called on every change."""
-        filename = self.image_files[self.current_index]
+        filename = self._filtered_files[self.current_index]
         stem = Path(filename).stem
 
-        # Copy image to dataset
+        # Move image to dataset (copy then delete from captures)
         src = CAPTURES_DIR / filename
         dst = IMAGES_DIR / filename
-        shutil.copy2(src, dst)
+        if src.exists():
+            shutil.copy2(src, dst)
+            src.unlink()
+        elif not dst.exists():
+            # Shouldn't happen, but guard against missing image
+            return
 
         # Write YOLO label file (empty file = no class present)
         label_path = LABELS_DIR / (stem + ".txt")
@@ -618,7 +1281,7 @@ class AnnotationTool:
 
     def _next_image(self):
         self._cancel_advance()
-        if self.current_index < len(self.image_files) - 1:
+        if self.current_index < len(self._filtered_files) - 1:
             self.current_index += 1
             self._load_image()
 
@@ -669,14 +1332,18 @@ class AnnotationTool:
 
     def _unmark_annotation(self):
         """Remove the current image from the dataset (un-annotate)."""
-        filename = self.image_files[self.current_index]
+        filename = self._filtered_files[self.current_index]
         stem = Path(filename).stem
 
-        # Remove from dataset
+        # Restore image back to captures from dataset
         img_dst = IMAGES_DIR / filename
-        label_dst = LABELS_DIR / (stem + ".txt")
+        cap_dst = CAPTURES_DIR / filename
         if img_dst.exists():
+            if not cap_dst.exists():
+                shutil.copy2(img_dst, cap_dst)
             img_dst.unlink()
+
+        label_dst = LABELS_DIR / (stem + ".txt")
         if label_dst.exists():
             label_dst.unlink()
 
@@ -686,19 +1353,19 @@ class AnnotationTool:
         self._update_labels()
 
     def _skip_to_unannotated(self):
-        """Jump to the next unannotated image."""
+        """Jump to the next unannotated image in the filtered set."""
         start = self.current_index + 1
-        for i in range(start, len(self.image_files)):
-            if not self.progress.is_annotated(self.image_files[i]):
+        for i in range(start, len(self._filtered_files)):
+            if not self.progress.is_annotated(self._filtered_files[i]):
                 self.current_index = i
                 self._load_image()
                 return
         for i in range(0, start):
-            if not self.progress.is_annotated(self.image_files[i]):
+            if not self.progress.is_annotated(self._filtered_files[i]):
                 self.current_index = i
                 self._load_image()
                 return
-        messagebox.showinfo("Done", "All images have been annotated!")
+        messagebox.showinfo("Done", "All images in this filter have been annotated!")
 
     def _open_bulk(self):
         """Open the bulk annotation window."""
@@ -708,12 +1375,17 @@ class AnnotationTool:
         BulkAnnotationWindow(self)
 
     def run(self):
-        # Find first unannotated image
-        for i, f in enumerate(self.image_files):
+        # Find first unannotated image in filtered set
+        for i, f in enumerate(self._filtered_files):
             if not self.progress.is_annotated(f):
                 self.current_index = i
                 self._load_image()
                 break
+        else:
+            # All annotated or empty filter — just show first
+            if self._filtered_files:
+                self.current_index = 0
+                self._load_image()
 
         self.root.mainloop()
 
@@ -1155,6 +1827,7 @@ def main():
     print()
     print("Controls:")
     print("  LMB drag     = draw box")
+    print("  Ctrl+drag    = draw box (no auto-advance, multi-box)")
     print("  RMB on box   = delete box")
     print("  A/D or ←/→   = prev/next image")
     print("  Space        = skip (no class in image)")
