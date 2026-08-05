@@ -80,8 +80,14 @@ MODEL_WEIGHTS = BASE_DIR / "models" / "best.pt"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 # LLM Vision QA settings
-LLM_BASE_URL = "http://192.168.86.48:8001"
-LLM_MODEL = "Qwen/Qwen2.5-VL-32B-Instruct-AWQ"
+LLM_BASE_URL = os.getenv(
+    "ARENA_AI_LLM_BASE_URL",
+    "http://127.0.0.1:8001",
+).rstrip("/")
+LLM_MODEL = os.getenv(
+    "ARENA_AI_LLM_MODEL",
+    "Qwen/Qwen2.5-VL-32B-Instruct-AWQ",
+)
 LLM_QA_PROMPT = (
     "You are an annotation quality assessor for a video game object detection dataset. "
     "The green bounding boxes drawn on this image are annotations that should tightly "
